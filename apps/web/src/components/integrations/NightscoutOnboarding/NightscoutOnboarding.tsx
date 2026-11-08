@@ -1030,7 +1030,7 @@ interface ReviewStepProps {
   isApplying: boolean;
 }
 
-function ReviewStep({
+export function ReviewStep({
   derivation,
   discovery,
   imports,
@@ -1064,6 +1064,10 @@ function ReviewStep({
   // any active override is invalid. Schedules don't take overrides
   // so they're not part of this check.
   const hasInvalidOverride = useMemo(() => {
+    const selectedDiaNeedsOverride =
+      imports.dia_hours &&
+      Boolean(derivation.dia_hours.reason) &&
+      overrides.dia_hours.trim() === "";
     const check = (
       flag: boolean,
       proposed: number | null,
@@ -1075,6 +1079,7 @@ function ReviewStep({
       raw.trim() !== "" &&
       parseOverride(raw, field) === null;
     return (
+      selectedDiaNeedsOverride ||
       check(
         imports.target_low,
         derivation.target_low.proposed_value,
@@ -1424,7 +1429,8 @@ export function NumericRow({
   field,
 }: NumericRowProps) {
   const noProposal = proposed === null;
-  const needsSafeOverride = Boolean(reason) && override.trim() === "";
+  const needsSafeOverride =
+    Boolean(reason) && override.trim() === "" && !checked;
   const importDisabled = noProposal || needsSafeOverride;
   // Empty override = "use the Nightscout proposal". Non-empty
   // override that doesn't parse to a positive number is a real
@@ -1436,14 +1442,19 @@ export function NumericRow({
       ? nightscoutDiaOverrideSchema
       : nightscoutOverrideSchema
   ).safeParse(override);
+  const missingRequiredOverride =
+    checked && Boolean(reason) && override.trim() === "";
   const overrideInvalid =
-    checked &&
+    missingRequiredOverride ||
+    (checked &&
     !noProposal &&
     override.trim() !== "" &&
-    !overrideValidation.success;
-  const overrideErrors = overrideInvalid
-    ? overrideValidation.error.issues.map((issue) => issue.message)
-    : [];
+    !overrideValidation.success);
+  const overrideErrors = missingRequiredOverride
+    ? ["Enter a DIA override between 2 and 8 hours, or uncheck DIA."]
+    : !overrideValidation.success
+      ? overrideValidation.error.issues.map((issue) => issue.message)
+      : [];
   return (
     <div
       className={twMerge(

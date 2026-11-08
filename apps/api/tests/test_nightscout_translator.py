@@ -16,6 +16,7 @@ indexes, and the per-target conflict resolution.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from collections.abc import AsyncGenerator
@@ -1154,8 +1155,17 @@ class TestBackfillPrimaryCgmSource:
     @pytest.mark.asyncio
     async def test_backfill_bg_ignores_other_users_readings(self, translator_ctx):
         """A reading belonging to another user -- in-window and
-        in-range -- must never fill this user's bolus."""
+        in-range -- must never fill this user's bolus.
+
+        Dexcom is primary for the fixture user, so the other user's
+        `dexcom` reading shares the resolved `bg_source`: the user
+        filter alone excludes it. Negative control: without
+        `gr.user_id = pe.user_id` this bolus would get 190.
+        """
         session, user_id, conn_id = translator_ctx
+
+        await _demote_ns_connection_to_secondary(session, conn_id)
+        await _add_dexcom_primary(session, user_id)
 
         other = User(
             email=f"other_{uuid.uuid4().hex[:10]}@example.com",
@@ -1211,6 +1221,225 @@ class TestBackfillPrimaryCgmSource:
             )
             await session.execute(delete(User).where(User.id == other.id))
             await session.commit()
+
+    @pytest.mark.asyncio
+    async def test_backfill_bg_prefers_current_user_over_newer_other_user_reading(
+        self, translator_ctx
+    ):
+        """Same source, both users in-window: the bolus takes the
+        current user's reading (14:30, 180) even though the other
+        user's reading (14:32, 190) is nearer -- the user filter,
+        not recency, decides.
+
+        Negative control: without `gr.user_id = pe.user_id` the
+        nearest-preceding anti-join would pick the other user's 190.
+        """
+        session, user_id, conn_id = translator_ctx
+
+        await _demote_ns_connection_to_secondary(session, conn_id)
+        await _add_dexcom_primary(session, user_id)
+
+        other = User(
+            email=f"other_{uuid.uuid4().hex[:10]}@example.com",
+            hashed_password="not-a-real-hash",
+        )
+        session.add(other)
+        await session.flush()
+        session.add(
+            GlucoseReading(
+                user_id=user_id,
+                value=180,
+                reading_timestamp=datetime(2026, 5, 6, 14, 30, tzinfo=UTC),
+                trend=TrendDirection.FLAT,
+                trend_rate=0.0,
+                received_at=datetime(2026, 5, 6, 14, 30, tzinfo=UTC),
+                source="dexcom",
+            )
+        )
+        session.add(
+            GlucoseReading(
+                user_id=other.id,
+                value=190,
+                reading_timestamp=datetime(2026, 5, 6, 14, 32, tzinfo=UTC),
+                trend=TrendDirection.FLAT,
+                trend_rate=0.0,
+                received_at=datetime(2026, 5, 6, 14, 32, tzinfo=UTC),
+                source="dexcom",
+            )
+        )
+        await session.flush()
+
+        try:
+            await translate_treatments(
+                [_load("treatments", "loop_correction_bolus")],
+                session=session,
+                user_id=str(user_id),
+                connection_id=str(conn_id),
+            )
+            await session.flush()
+
+            await translate_devicestatuses(
+                [],
+                session=session,
+                user_id=str(user_id),
+                connection_id=str(conn_id),
+                received_at=datetime(2026, 5, 6, 14, 32, 18, tzinfo=UTC),
+            )
+            await session.flush()
+
+            bolus_row = (
+                await session.execute(
+                    select(PumpEvent).where(
+                        PumpEvent.user_id == user_id,
+                        PumpEvent.event_type == PumpEventType.BOLUS,
+                    )
+                )
+            ).scalar_one()
+            assert bolus_row.bg_at_event == 180
+        finally:
+            # The fixture teardown only cleans up the fixture user's
+            # rows -- remove the other user's rows here.
+            await session.execute(
+                delete(GlucoseReading).where(GlucoseReading.user_id == other.id)
+            )
+            await session.execute(delete(User).where(User.id == other.id))
+            await session.commit()
+
+    @pytest.mark.asyncio
+    async def test_backfill_bg_falls_back_to_connection_source_without_primary(
+        self, translator_ctx
+    ):
+        """No source is primary (NS connection demoted, no Dexcom):
+        the BG half falls back to the connection's own source, so
+        the bolus still gets the NS reading (14:32, 250) instead of
+        going dark.
+
+        Negative control: on a lookup that returned None and then
+        skipped the BG half, bg_at_event would stay NULL.
+        """
+        session, user_id, conn_id = translator_ctx
+
+        await _demote_ns_connection_to_secondary(session, conn_id)
+
+        await translate_treatments(
+            [_load("treatments", "loop_correction_bolus")],
+            session=session,
+            user_id=str(user_id),
+            connection_id=str(conn_id),
+        )
+        await session.flush()
+
+        await translate_entries(
+            [_sgv_at(32, 250, tag="fallback-ns-near")],
+            session=session,
+            user_id=str(user_id),
+            connection_id=str(conn_id),
+        )
+        await session.flush()
+
+        await translate_devicestatuses(
+            [],
+            session=session,
+            user_id=str(user_id),
+            connection_id=str(conn_id),
+            received_at=datetime(2026, 5, 6, 14, 32, 18, tzinfo=UTC),
+        )
+        await session.flush()
+
+        bolus_row = (
+            await session.execute(
+                select(PumpEvent).where(
+                    PumpEvent.user_id == user_id,
+                    PumpEvent.event_type == PumpEventType.BOLUS,
+                )
+            )
+        ).scalar_one()
+        assert bolus_row.bg_at_event == 250
+
+    @pytest.mark.asyncio
+    async def test_backfill_bg_falls_back_when_primary_lookup_fails(
+        self, translator_ctx, monkeypatch, caplog
+    ):
+        """A DB-level failure in the primary-source lookup must not
+        poison the outer savepoint: the lookup's own nested
+        savepoint absorbs the failure, the warning is logged (with
+        traceback), the backfill falls back to the connection's own
+        source, and the BG update still executes -- the bolus gets
+        the NS reading (14:32, 250), not the Dexcom one (14:30, 180).
+
+        Negative control: without the nested savepoint around the
+        lookup, the aborted outer transaction would fail the BG
+        update too and bg_at_event would stay NULL.
+        """
+        session, user_id, conn_id = translator_ctx
+
+        await _demote_ns_connection_to_secondary(session, conn_id)
+        await _add_dexcom_primary(session, user_id)
+
+        async def _failing_lookup(*args, **kwargs):
+            raise RuntimeError("simulated primary-source lookup failure")
+
+        monkeypatch.setattr(
+            "src.services.integrations.nightscout.translator.get_primary_cgm_source",
+            _failing_lookup,
+        )
+
+        await translate_treatments(
+            [_load("treatments", "loop_correction_bolus")],
+            session=session,
+            user_id=str(user_id),
+            connection_id=str(conn_id),
+        )
+        await session.flush()
+
+        session.add(
+            GlucoseReading(
+                user_id=user_id,
+                value=180,
+                reading_timestamp=datetime(2026, 5, 6, 14, 30, tzinfo=UTC),
+                trend=TrendDirection.FLAT,
+                trend_rate=0.0,
+                received_at=datetime(2026, 5, 6, 14, 30, tzinfo=UTC),
+                source="dexcom",
+            )
+        )
+        await translate_entries(
+            [_sgv_at(32, 250, tag="lookup-fail-ns-near")],
+            session=session,
+            user_id=str(user_id),
+            connection_id=str(conn_id),
+        )
+        await session.flush()
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="src.services.integrations.nightscout.translator",
+        ):
+            await translate_devicestatuses(
+                [],
+                session=session,
+                user_id=str(user_id),
+                connection_id=str(conn_id),
+                received_at=datetime(2026, 5, 6, 14, 32, 18, tzinfo=UTC),
+            )
+        await session.flush()
+
+        assert any(
+            r.name == "src.services.integrations.nightscout.translator"
+            and "nightscout_backfill_primary_cgm_lookup_failed" in r.getMessage()
+            and r.exc_info
+            for r in caplog.records
+        ), "expected the lookup-failure warning (with traceback) to be logged"
+
+        bolus_row = (
+            await session.execute(
+                select(PumpEvent).where(
+                    PumpEvent.user_id == user_id,
+                    PumpEvent.event_type == PumpEventType.BOLUS,
+                )
+            )
+        ).scalar_one()
+        assert bolus_row.bg_at_event == 250
 
     @pytest.mark.asyncio
     async def test_backfill_bg_skips_out_of_range_primary_reading(self, translator_ctx):

@@ -701,14 +701,21 @@ async def _backfill_bolus_context(
     # failure we fall back to the connection's own source -- the
     # previous behavior -- rather than failing the sync, since this
     # backfill is opportunistic and its caller swallows failures.
+    # The lookup runs in its own nested SAVEPOINT: this function
+    # itself runs inside the pump-events `begin_nested()` in
+    # `translate_devicestatuses`, so a DB-level lookup failure
+    # without the inner savepoint would abort that outer savepoint
+    # and the fallback BG update -- plus the IoB / COB update and
+    # pump-event upserts -- would roll back with it.
     try:
-        bg_source = (
-            await get_primary_cgm_source(session, uuid.UUID(str(user_id))) or source
-        )
+        async with session.begin_nested():
+            primary = await get_primary_cgm_source(session, uuid.UUID(str(user_id)))
+        bg_source = primary or source
     except Exception:
         logger.warning(
             "nightscout_backfill_primary_cgm_lookup_failed",
             extra={"user_id": user_id},
+            exc_info=True,
         )
         bg_source = source
     bg_stmt = text(  # nosemgrep: avoid-sqlalchemy-text

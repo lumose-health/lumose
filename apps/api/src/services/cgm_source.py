@@ -144,6 +144,27 @@ async def list_cgm_sources(db: AsyncSession, user_id: uuid.UUID) -> list[CgmSour
     return sources
 
 
+async def get_primary_cgm_source(db: AsyncSession, user_id: uuid.UUID) -> str | None:
+    """Source string of the user's primary CGM source, or ``None``.
+
+    The first source carrying role ``primary`` wins (Dexcom first,
+    then Nightscout connections by creation order -- the order
+    ``list_cgm_sources`` returns). Two primaries (the tolerated
+    creation race in ``default_cgm_role_for_new_source``) resolve
+    deterministically to the first.
+
+    ``None`` when no source is currently primary (legacy/unset
+    roles). Callers fall back to the connection's own source rather
+    than skipping, mirroring the fail-safe in
+    ``get_excluded_cgm_sources`` -- showing the survivor beats going
+    dark.
+    """
+    for src in await list_cgm_sources(db, user_id):
+        if src.role == CGM_ROLE_PRIMARY:
+            return src.source
+    return None
+
+
 async def get_excluded_cgm_sources(
     db: AsyncSession,
     user_id: uuid.UUID,

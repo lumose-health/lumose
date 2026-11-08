@@ -57,6 +57,7 @@ either an `is_retracted` column or DELETE-on-soft-delete logic.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -72,6 +73,7 @@ from src.models.forecast_snapshot import ForecastSnapshot
 from src.models.glucose import GlucoseReading
 from src.models.nightscout_profile_snapshot import NightscoutProfileSnapshot
 from src.models.pump_data import PumpEvent
+from src.services.cgm_source import get_primary_cgm_source
 from src.services.integrations.nightscout._devicestatus_mapper import (
     map_devicestatus_to_snapshot,
 )
@@ -613,9 +615,18 @@ async def _backfill_bolus_context(
     backfill covers the rest from the CGM stream.
 
     Bounded by:
-    - `source` -- only this NS connection's rows (bolus side and
-      reading side alike -- the entries route stores readings under
-      the same `nightscout:<connection_id>` source).
+    - `source` -- only this NS connection's bolus rows (and its
+      devicestatus snapshots for the IoB / COB half). The BG half
+      reads from the user's PRIMARY CGM source instead (issue
+      #1058): a direct integration may have stored the reading
+      first -- the Nightscout copy is then dropped on the
+      (user_id, reading_timestamp) conflict, so `gr.source =
+      pe.source` never matches -- and when the connection carries
+      a different sensor than the primary, the old join filled
+      bg_at_event from the wrong sensor while correction analysis
+      measures outcomes against the primary. When no source is
+      currently primary (legacy/unset roles) the BG half falls back
+      to this connection's own source -- the previous behavior.
     - `cutoff` -- caller-supplied lower bound (usually 14 days ago)
       for the devicestatus IoB / COB half; old historical boluses
       don't get retroactive context updates.
@@ -683,6 +694,23 @@ async def _backfill_bolus_context(
     # are copied: CGM readings are stored as-is, so an out-of-range
     # reading must not land in bg_at_event either -- the column
     # stays NULL for those boluses.
+    #
+    # Issue #1058: the reading comes from the user's PRIMARY CGM
+    # source, not the bolus's own connection (see the "Bounded by"
+    # note above). Resolving the primary is best-effort: on any
+    # failure we fall back to the connection's own source -- the
+    # previous behavior -- rather than failing the sync, since this
+    # backfill is opportunistic and its caller swallows failures.
+    try:
+        bg_source = (
+            await get_primary_cgm_source(session, uuid.UUID(str(user_id))) or source
+        )
+    except Exception:
+        logger.warning(
+            "nightscout_backfill_primary_cgm_lookup_failed",
+            extra={"user_id": user_id},
+        )
+        bg_source = source
     bg_stmt = text(  # nosemgrep: avoid-sqlalchemy-text
         """
         UPDATE pump_events AS pe
@@ -694,7 +722,7 @@ async def _backfill_bolus_context(
           AND pe.bg_at_event IS NULL
           AND pe.event_timestamp >= :bg_cutoff
           AND gr.user_id = pe.user_id
-          AND gr.source = pe.source
+          AND gr.source = :bg_source
           AND gr.value BETWEEN 20 AND 500
           AND gr.reading_timestamp <= pe.event_timestamp
           AND gr.reading_timestamp >= pe.event_timestamp - INTERVAL '15 minutes'
@@ -704,7 +732,7 @@ async def _backfill_bolus_context(
           AND NOT EXISTS (
               SELECT 1 FROM glucose_readings AS gr2
               WHERE gr2.user_id = pe.user_id
-                AND gr2.source = pe.source
+                AND gr2.source = :bg_source
                 AND gr2.reading_timestamp <= pe.event_timestamp
                 AND gr2.reading_timestamp >= pe.event_timestamp - INTERVAL '15 minutes'
                 AND gr2.reading_timestamp > gr.reading_timestamp
@@ -716,6 +744,7 @@ async def _backfill_bolus_context(
         {
             "user_id": user_id,
             "source": source,
+            "bg_source": bg_source,
             "bg_cutoff": bg_cutoff if bg_cutoff is not None else cutoff,
         },
     )

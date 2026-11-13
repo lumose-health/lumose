@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import {
   getNightscoutOnboardingCredentialErrors,
+  nightscoutDiaOverrideSchema,
   nightscoutOnboardingCredentialsSchema,
   nightscoutOverrideSchema,
   type NightscoutOnboardingCredentialErrors,
@@ -340,8 +341,15 @@ function formatTime(startMinutes: number): string {
   return `${displayHour}:${m.toString().padStart(2, "0")} ${period}`;
 }
 
-function parseOverride(raw: string): number | null {
-  const result = nightscoutOverrideSchema.safeParse(raw);
+function parseOverride(
+  raw: string,
+  field?: keyof OverrideValues,
+): number | null {
+  const schema =
+    field === "dia_hours"
+      ? nightscoutDiaOverrideSchema
+      : nightscoutOverrideSchema;
+  const result = schema.safeParse(raw);
   return result.success ? result.data : null;
 }
 
@@ -567,7 +575,7 @@ export function NightscoutOnboarding(_props: NightscoutOnboardingProps = {}) {
       ? parseOverride(state.overrides.target_high)
       : null;
     const overrideDia = state.imports.dia_hours
-      ? parseOverride(state.overrides.dia_hours)
+      ? parseOverride(state.overrides.dia_hours, "dia_hours")
       : null;
 
     const body: NightscoutApplyOnboardingRequest = {
@@ -1022,7 +1030,7 @@ interface ReviewStepProps {
   isApplying: boolean;
 }
 
-function ReviewStep({
+export function ReviewStep({
   derivation,
   discovery,
   imports,
@@ -1056,16 +1064,22 @@ function ReviewStep({
   // any active override is invalid. Schedules don't take overrides
   // so they're not part of this check.
   const hasInvalidOverride = useMemo(() => {
+    const selectedDiaNeedsOverride =
+      imports.dia_hours &&
+      Boolean(derivation.dia_hours.reason) &&
+      overrides.dia_hours.trim() === "";
     const check = (
       flag: boolean,
       proposed: number | null,
       raw: string,
+      field?: keyof OverrideValues,
     ): boolean =>
       flag &&
       proposed !== null &&
       raw.trim() !== "" &&
-      parseOverride(raw) === null;
+      parseOverride(raw, field) === null;
     return (
+      selectedDiaNeedsOverride ||
       check(
         imports.target_low,
         derivation.target_low.proposed_value,
@@ -1080,6 +1094,7 @@ function ReviewStep({
         imports.dia_hours,
         derivation.dia_hours.proposed_value,
         overrides.dia_hours,
+        "dia_hours",
       )
     );
   }, [imports, overrides, derivation]);
@@ -1181,6 +1196,7 @@ function ReviewStep({
           onToggle={() => onToggleImport("dia_hours")}
           current={derivation.dia_hours.current_value}
           proposed={derivation.dia_hours.proposed_value}
+          reason={derivation.dia_hours.reason}
           override={overrides.dia_hours}
           onOverrideChange={(v) => onUpdateOverride("dia_hours", v)}
           field="dia_hours"
@@ -1394,37 +1410,51 @@ interface NumericRowProps {
   onToggle: () => void;
   current: number | null;
   proposed: number | null;
+  reason?: string | null;
   override: string;
   onOverrideChange: (value: string) => void;
   field: string;
 }
 
-function NumericRow({
+export function NumericRow({
   label,
   unitsHint,
   checked,
   onToggle,
   current,
   proposed,
+  reason,
   override,
   onOverrideChange,
   field,
 }: NumericRowProps) {
   const noProposal = proposed === null;
+  const needsSafeOverride =
+    Boolean(reason) && override.trim() === "" && !checked;
+  const importDisabled = noProposal || needsSafeOverride;
   // Empty override = "use the Nightscout proposal". Non-empty
   // override that doesn't parse to a positive number is a real
   // user-entered value the wizard would silently drop (parseOverride
   // returns null) -- flag it visibly so the user doesn't end up with
   // the NS proposal believing their typed value won.
-  const overrideValidation = nightscoutOverrideSchema.safeParse(override);
+  const overrideValidation = (
+    field === "dia_hours"
+      ? nightscoutDiaOverrideSchema
+      : nightscoutOverrideSchema
+  ).safeParse(override);
+  const missingRequiredOverride =
+    checked && Boolean(reason) && override.trim() === "";
   const overrideInvalid =
-    checked &&
+    missingRequiredOverride ||
+    (checked &&
     !noProposal &&
     override.trim() !== "" &&
-    !overrideValidation.success;
-  const overrideErrors = overrideInvalid
-    ? overrideValidation.error.issues.map((issue) => issue.message)
-    : [];
+    !overrideValidation.success);
+  const overrideErrors = missingRequiredOverride
+    ? ["Enter a DIA override between 2 and 8 hours, or uncheck DIA."]
+    : !overrideValidation.success
+      ? overrideValidation.error.issues.map((issue) => issue.message)
+      : [];
   return (
     <div
       className={twMerge(
@@ -1439,7 +1469,7 @@ function NumericRow({
     >
       <Checkbox
         checked={checked}
-        disabled={noProposal}
+        disabled={importDisabled}
         data-testid={`wizard-import-${field}`}
         label={
           <span className="font_ui_label text-foreground-primary">{label}</span>
@@ -1463,16 +1493,21 @@ function NumericRow({
         <TextInput
           containerClassName="w-28"
           data-testid={`wizard-override-${field}`}
-          disabled={!checked || noProposal}
+          disabled={noProposal || (!checked && !reason)}
           id={`wiz-${field}-override`}
           inputMode="decimal"
           errorMessages={overrideErrors}
           label={`Override ${label}`}
           labelClassName="sr-only"
-          min="0"
+          max={field === "dia_hours" ? "8" : undefined}
+          min={field === "dia_hours" ? "2" : "0"}
           onChange={(event) => onOverrideChange(event.target.value)}
           placeholder={
-            proposed !== null ? `Use ${formatNumber(proposed).toString()}` : ""
+            reason
+              ? "Enter 2–8"
+              : proposed !== null
+                ? `Use ${formatNumber(proposed).toString()}`
+                : ""
           }
           step="any"
           type="number"
@@ -1482,6 +1517,14 @@ function NumericRow({
           {unitsHint}
         </span>
       </div>
+      {reason && (
+        <p
+          className="font_body_3 basis-full text-signal-warning-text"
+          data-testid={`wizard-reason-${field}`}
+        >
+          {reason}
+        </p>
+      )}
     </div>
   );
 }

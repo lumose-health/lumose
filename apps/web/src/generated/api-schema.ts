@@ -5405,6 +5405,11 @@ export interface components {
             ai_summary: string;
             /** Average Glucose */
             average_glucose: number;
+            /**
+             * Basal Estimate Complete
+             * @description Whether evaluated basal intervals were complete; null means no basal interval was evaluated
+             */
+            basal_estimate_complete?: boolean | null;
             /** Correction Count */
             correction_count: number;
             /**

@@ -16,7 +16,7 @@ from src.models.glucose import GlucoseReading, TrendDirection
 from src.models.pump_data import PumpEvent, PumpEventType
 from src.models.user import User
 from src.schemas.ai_response import AIResponse, AIUsage
-from src.schemas.daily_brief import DailyBriefMetrics
+from src.schemas.daily_brief import DailyBriefMetrics, InsulinBreakdown
 from src.services.daily_brief import (
     HIGH_THRESHOLD,
     LOW_THRESHOLD,
@@ -709,6 +709,7 @@ class TestGenerateDailyBrief:
         assert brief.ai_provider == "claude"
         assert brief.input_tokens == 100
         assert brief.output_tokens == 50
+        assert brief.basal_estimate_complete is None
         assert mock_db.add.call_count == 2  # brief + safety log
         mock_db.flush.assert_called_once()
         mock_db.commit.assert_called_once()
@@ -982,6 +983,8 @@ class TestBriefsEndpoints:
     @patch("src.services.daily_brief.calculate_metrics")
     async def test_generate_brief_endpoint(self, mock_calc, mock_get_client):
         """Test POST /api/ai/briefs/generate returns 201."""
+        breakdown = InsulinBreakdown(basal_estimate_complete=False)
+        breakdown._basal_estimate_evaluated = True
         mock_calc.return_value = DailyBriefMetrics(
             time_in_range_pct=75.0,
             average_glucose=140.0,
@@ -990,6 +993,7 @@ class TestBriefsEndpoints:
             readings_count=288,
             correction_count=3,
             total_insulin=38.0,
+            insulin_breakdown=breakdown,
         )
 
         mock_client = AsyncMock()
@@ -1014,6 +1018,7 @@ class TestBriefsEndpoints:
         data = response.json()
         assert data["time_in_range_pct"] == 75.0
         assert data["average_glucose"] == 140.0
+        assert data["basal_estimate_complete"] is False
         assert "Good day overall with some highs." in data["ai_summary"]
         assert "Safety Notice" in data["ai_summary"]
         assert data["ai_model"] == "claude-sonnet-4-5-20250929"

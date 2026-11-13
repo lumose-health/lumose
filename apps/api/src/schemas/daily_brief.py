@@ -6,11 +6,13 @@ Request and response schemas for daily brief generation and retrieval.
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class InsulinBreakdown(BaseModel):
     """Breakdown of insulin delivery by type."""
+
+    _basal_estimate_evaluated: bool = PrivateAttr(default=False)
 
     bolus_units: float = Field(default=0.0, description="Manual bolus insulin (units)")
     bolus_count: int = Field(default=0, description="Number of manual boluses")
@@ -27,6 +29,13 @@ class InsulinBreakdown(BaseModel):
     basal_units: float = Field(
         default=0.0,
         description="Estimated basal delivery (rate x time integration)",
+    )
+    basal_estimate_complete: bool = Field(
+        default=True,
+        description=(
+            "False when an explicit temp-basal gap could not be filled because "
+            "the scheduled profile rate was unavailable"
+        ),
     )
     basal_injection_units: float = Field(
         default=0.0,

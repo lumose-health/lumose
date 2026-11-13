@@ -1376,8 +1376,8 @@ class TestBackfillPrimaryCgmSource:
         await _demote_ns_connection_to_secondary(session, conn_id)
         await _add_dexcom_primary(session, user_id)
 
-        async def _failing_lookup(*args, **kwargs):
-            raise RuntimeError("simulated primary-source lookup failure")
+        async def _failing_lookup(db, *args, **kwargs):
+            await db.execute(text("SELECT 1/0"))
 
         monkeypatch.setattr(
             "src.services.integrations.nightscout.translator.get_primary_cgm_source",

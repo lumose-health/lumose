@@ -2343,6 +2343,18 @@
             "title": "Average Glucose",
             "type": "number"
           },
+          "basal_estimate_complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the basal estimate covered the full interval; null means the estimate was not evaluated",
+            "title": "Basal Estimate Complete"
+          },
           "correction_count": {
             "title": "Correction Count",
             "type": "integer"

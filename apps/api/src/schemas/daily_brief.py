@@ -83,6 +83,13 @@ class DailyBriefResponse(BaseModel):
     readings_count: int
     correction_count: int
     total_insulin: float | None
+    basal_estimate_complete: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the basal estimate covered the full interval; null means "
+            "the estimate was not evaluated"
+        ),
+    )
     ai_summary: str
     ai_model: str
     ai_provider: str

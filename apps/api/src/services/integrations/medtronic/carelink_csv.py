@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from loguru import logger
+from src.core.treatment_safety.models import MAX_GLUCOSE_MGDL, MIN_GLUCOSE_MGDL
+from src.core.units import MGDL_PER_MMOL
 
 # --- Canonical CareLink column names (observed in the v15.x export header) ---
 COL_INDEX = "Index"
@@ -144,6 +146,17 @@ def _parse_int(value: str | None) -> int | None:
         return None
 
 
+def _parse_glucose_mgdl(value: str | None, *, is_mmol: bool) -> int | None:
+    """Parse glucose into canonical mg/dL and enforce the storage boundary."""
+    parsed = _parse_float(value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    converted = int(round(parsed * MGDL_PER_MMOL if is_mmol else parsed))
+    if not MIN_GLUCOSE_MGDL <= converted <= MAX_GLUCOSE_MGDL:
+        return None
+    return converted
+
+
 def _parse_timestamp(date_s: str | None, time_s: str | None) -> datetime | None:
     d = _clean(date_s)
     t = _clean(time_s)
@@ -219,22 +232,11 @@ def parse_carelink_csv(text: str, *, keep_raw: bool = False) -> CareLinkExport:
             header = [c.strip() for c in fields_]
             col = {name: i for i, name in enumerate(header)}
             export.section_count += 1
-            # Detect European mmol/L export headers. Exact format is unconfirmed
-            # without a real sample, so log and skip glucose rows rather than
-            # risk storing a mis-converted value.
-            # TODO: once a real European CareLink export is available, parse the
-            # mmol/L glucose columns and convert via src.core.units.MGDL_PER_MMOL
-            # instead of dropping them. Deferred -- no confirmed sample to map against.
+            # In mmol/L sections, only the explicitly mmol/L-named columns are
+            # trusted. Some exports carry both unit variants in one section.
             is_mmol_section = (
                 COL_BG_READING_MMOL in col or COL_SENSOR_GLUCOSE_MMOL in col
             )
-            if is_mmol_section:
-                logger.warning(
-                    "CareLink CSV section {} has mmol/L headers, exact European format "
-                    "unconfirmed. Glucose values in this section will be dropped to avoid "
-                    "mis-storing unconverted readings (insulin/carb/event fields are kept)",
-                    export.section_count,
-                )
             continue
 
         # Metadata preamble lines (before the first header). Lift a few useful
@@ -259,18 +261,21 @@ def parse_carelink_csv(text: str, *, keep_raw: bool = False) -> CareLinkExport:
                 timestamp=ts,
                 index=idx,
                 bg_source=_clean(get(fields_, COL_BG_SOURCE)),
-                # In a mmol/L section the mg/dL-named columns can't be trusted (a real
-                # European export may carry both), so drop glucose entirely rather than
-                # store a possibly-mmol value as mg/dL. Non-glucose fields stay.
-                bg_mgdl=(
-                    None
-                    if is_mmol_section
-                    else _parse_int(get(fields_, COL_BG_READING))
+                bg_mgdl=_parse_glucose_mgdl(
+                    get(
+                        fields_,
+                        COL_BG_READING_MMOL if is_mmol_section else COL_BG_READING_MGDL,
+                    ),
+                    is_mmol=is_mmol_section,
                 ),
-                sensor_glucose_mgdl=(
-                    None
-                    if is_mmol_section
-                    else _parse_int(get(fields_, COL_SENSOR_GLUCOSE))
+                sensor_glucose_mgdl=_parse_glucose_mgdl(
+                    get(
+                        fields_,
+                        COL_SENSOR_GLUCOSE_MMOL
+                        if is_mmol_section
+                        else COL_SENSOR_GLUCOSE_MGDL,
+                    ),
+                    is_mmol=is_mmol_section,
                 ),
                 isig=_parse_float(get(fields_, COL_ISIG)),
                 basal_rate_uh=_parse_float(get(fields_, COL_BASAL_RATE)),

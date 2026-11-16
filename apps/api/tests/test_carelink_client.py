@@ -1,7 +1,8 @@
 """Tests for the CareLink HTTP client data methods (mocked, no network)."""
 
 import json
-from datetime import date, datetime
+import logging
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -58,6 +59,28 @@ async def test_get_patient_id_tolerant_field():
         assert await client.get_patient_id() == "50497203"
 
 
+async def test_get_patient_id_is_region_aware_when_both_ids_exist():
+    response = {
+        "patientId": None,
+        "id": "eu-report-id",
+        "accountId": "account-record-id",
+        "loginId": "login-record-id",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/patient/users/me"
+        return httpx.Response(200, json=response)
+
+    async with _make_client(
+        handler, base_url="https://carelink.minimed.eu"
+    ) as eu_client:
+        assert await eu_client.get_patient_id() == "eu-report-id"
+
+    async with _make_client(handler, base_url=US_BASE_URL) as us_client:
+        # Preserve the established US fallback order exactly.
+        assert await us_client.get_patient_id() == "account-record-id"
+
+
 async def test_export_csv_full_job_flow():
     """generateReport -> reportStatus (pending then ready) -> reportCsv."""
     captured = {}
@@ -68,6 +91,7 @@ async def test_export_csv_full_job_flow():
         path = request.url.path
         if path == "/patient/reports/generateReport":
             captured["body"] = json.loads(request.content)
+            captured["content_type"] = request.headers["content-type"]
             return httpx.Response(200, json={"uuid": "abc-123"})
         if path == "/patient/reports/reportStatus":
             assert request.url.params["uuid"] == "abc-123"
@@ -99,6 +123,70 @@ async def test_export_csv_full_job_flow():
     assert body["startDate"] == "2025-01-18"
     assert body["endDate"] == "2025-01-31"
     assert body["reportShowLogbook"] is False
+    assert body["dailyDetailReportDays"] == []
+    assert "startDatePeriodB" not in body
+    assert "endDatePeriodB" not in body
+    assert captured["content_type"] == "application/json"
+
+
+def test_generate_report_body_matches_eu_browser_shape():
+    local_time = datetime(
+        2026, 11, 2, 23, 2, 7, 123456, tzinfo=timezone(timedelta(hours=1))
+    )
+    body = CareLinkClient._build_generate_report_body(
+        patient_id="eu-report-id",
+        start_date=date(2026, 10, 30),
+        end_date=date(2026, 11, 2),
+        client_time=local_time,
+        eu_format=True,
+    )
+
+    assert body["clientTime"] == "2026-11-02T23:02:07+01:00"
+    assert body["dailyDetailReportDays"] == [
+        "2026-11-02",
+        "2026-11-01",
+        "2026-10-31",
+        "2026-10-30",
+    ]
+    assert body["startDatePeriodB"] == "2026-10-26"
+    assert body["endDatePeriodB"] == "2026-10-29"
+    assert {
+        key: value for key, value in body.items() if key.startswith("reportShow")
+    } == {
+        "reportShowAdherence": True,
+        "reportShowAssessmentAndProgress": True,
+        "reportShowBolusWizardFoodBolus": True,
+        "reportShowDashBoard": True,
+        "reportShowDataTable": False,
+        "reportShowDeviceSettings": True,
+        "reportShowEpisodeSummary": True,
+        "reportShowLogbook": True,
+        "reportShowOverview": True,
+        "reportShowWeeklyReview": True,
+        "reportShowSettingsHistory": False,
+        "reportShowInsulinAssessment": False,
+    }
+
+
+async def test_eu_generate_report_uses_charset_content_type():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/patient/reports/generateReport":
+            captured["content_type"] = request.headers["content-type"]
+            return httpx.Response(200, json={"uuid": "made-up-job"})
+        if request.url.path == "/patient/reports/reportStatus":
+            return httpx.Response(204)
+        return httpx.Response(200, text="Index;Date;Time\n")
+
+    async with _make_client(handler, base_url="https://carelink.minimed.eu") as client:
+        await client.export_csv(
+            patient_id="eu-report-id",
+            start_date=date(2026, 11, 1),
+            end_date=date(2026, 11, 1),
+        )
+
+    assert captured["content_type"] == "application/json; charset=UTF-8"
 
 
 async def test_export_csv_times_out_if_never_ready():
@@ -172,6 +260,90 @@ async def test_reachable_4xx_is_base_error_not_transport():
         with pytest.raises(CareLinkError) as exc_info:
             await client.get_patient_id()
     assert exc_info.type is CareLinkError
+
+
+async def test_4xx_logs_diagnostic_body_with_sensitive_values_scrubbed(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "message": "Malformed JSON in request body",
+                "field": "clientTime",
+                "detail": "Fixture Person used fixture-token-value",
+                "patientId": "patient-fixture-id",
+                "accountId": "account-fixture-id",
+                "name": "Fixture Person",
+                "token": "fixture-token-value",
+                "reportData": "Index;Date;Sensor Glucose (mmol/L)",
+            },
+        )
+
+    caplog.set_level(
+        logging.WARNING,
+        logger="src.services.integrations.medtronic.client",
+    )
+    async with _make_client(handler) as client:
+        with pytest.raises(CareLinkError):
+            await client.get_patient_id()
+
+    record = next(r for r in caplog.records if r.message == "CareLink request rejected")
+    logged = record.extra_fields["response_body"]
+    assert "Malformed JSON in request body" in logged
+    assert "clientTime" in logged
+    assert "patient-fixture-id" not in logged
+    assert "account-fixture-id" not in logged
+    assert "Fixture Person" not in logged
+    assert "fixture-token-value" not in logged
+    assert "Sensor Glucose" not in logged
+    assert "[redacted]" in logged
+
+
+async def test_4xx_oversized_body_is_not_logged(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="x" * 5000)
+
+    caplog.set_level(
+        logging.WARNING,
+        logger="src.services.integrations.medtronic.client",
+    )
+    async with _make_client(handler) as client:
+        with pytest.raises(CareLinkError):
+            await client.get_patient_id()
+
+    record = next(r for r in caplog.records if r.message == "CareLink request rejected")
+    assert record.extra_fields["response_body"] == "[oversized body redacted]"
+
+
+async def test_4xx_unstructured_body_is_fully_redacted(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="Fixture Person has account short-id")
+
+    caplog.set_level(
+        logging.WARNING,
+        logger="src.services.integrations.medtronic.client",
+    )
+    async with _make_client(handler) as client:
+        with pytest.raises(CareLinkError):
+            await client.get_patient_id()
+
+    record = next(r for r in caplog.records if r.message == "CareLink request rejected")
+    assert record.extra_fields["response_body"] == "[non-JSON body redacted]"
+
+
+async def test_4xx_json_message_with_unkeyed_identity_is_redacted(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"message": "Fixture Person rejected"})
+
+    caplog.set_level(
+        logging.WARNING,
+        logger="src.services.integrations.medtronic.client",
+    )
+    async with _make_client(handler) as client:
+        with pytest.raises(CareLinkError):
+            await client.get_patient_id()
+
+    record = next(r for r in caplog.records if r.message == "CareLink request rejected")
+    assert record.extra_fields["response_body"] == '{"message":"[redacted]"}'
 
 
 async def test_status_204_is_treated_ready():

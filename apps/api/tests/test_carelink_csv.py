@@ -5,8 +5,6 @@ All CSV content here is synthetic -- no real patient data.
 
 from datetime import datetime
 
-from loguru import logger
-
 from src.services.integrations.medtronic.carelink_csv import (
     CareLinkRow,
     parse_carelink_csv,
@@ -315,51 +313,81 @@ def test_raw_is_empty_unless_keep_raw():
     assert kept.get("Basal Rate (U/h)") == "0.7"
 
 
-def test_carelink_mmol_header_detected_and_glucose_skipped():
-    """CareLink CSV with mmol/L headers: glucose rows are skipped visibly."""
-    csv_text = (
-        "Index,Date,Time,BG Source,BG Reading (mmol/L),Sensor Glucose (mmol/L)\n"
-        "0,2026-05-06,11:30:00,Meter,5.5,6.1\n"
+def test_carelink_eu_mmol_sections_convert_and_keep_decimal_comma_events():
+    """Synthetic EU rows use semicolons and decimal commas throughout."""
+    mmol_header = [
+        "Index",
+        "Date",
+        "Time",
+        "BG Source",
+        "BG Reading (mg/dL)",
+        "BG Reading (mmol/L)",
+        "Sensor Glucose (mg/dL)",
+        "Sensor Glucose (mmol/L)",
+        "Bolus Volume Delivered (U)",
+        "BWZ Carb Input (grams)",
+    ]
+    mgdl_header = [
+        "Index",
+        "Date",
+        "Time",
+        "BG Source",
+        "BG Reading (mg/dL)",
+        "Sensor Glucose (mg/dL)",
+    ]
+    csv_text = "\n".join(
+        [
+            ";".join(mmol_header),
+            ";".join(
+                [
+                    "0",
+                    "2026-05-06",
+                    "11:30:00",
+                    "Meter",
+                    "499",
+                    "7,2",
+                    "498",
+                    "6,1",
+                    "1,5",
+                    "42,5",
+                ]
+            ),
+            ";".join(mgdl_header),
+            ";".join(["1", "2026-05-06", "11:35:00", "Meter", "120", "145"]),
+        ]
     )
+
     export = parse_carelink_csv(csv_text)
-    assert export.section_count == 1
-    assert len(export.rows) == 1
-    # Glucose values must be None -- skipped, not stored as raw mmol numbers
-    for row in export.rows:
-        assert row.bg_mgdl is None
-        assert row.sensor_glucose_mgdl is None
+    assert export.section_count == 2
+    eu, us = export.rows
+    assert eu.bg_mgdl == 130
+    assert eu.sensor_glucose_mgdl == 110
+    # The populated mg/dL-named values in the mmol section were distrusted.
+    assert eu.bg_mgdl != 499
+    assert eu.sensor_glucose_mgdl != 498
+    assert eu.bolus_delivered_u == 1.5
+    assert eu.carb_input_g == 42.5
+    assert us.bg_mgdl == 120
+    assert us.sensor_glucose_mgdl == 145
 
 
-def test_carelink_mmol_section_drops_populated_mgdl_columns_and_warns():
-    """A mmol section that ALSO carries populated mg/dL-named glucose columns still
-    drops glucose, and emits the operator warning.
-
-    This is the enforcement guard: the mmol headers signal the section's true unit, so
-    even the mg/dL-named values (180/200 here) must be dropped -- without the explicit
-    ``is_mmol_section`` skip they would be stored as mg/dL. Non-glucose fields (basal)
-    are retained. The earlier mmol-only test passes incidentally because the mg/dL alias
-    simply isn't present; this one cannot.
-    """
-    csv_text = (
-        "Index,Date,Time,BG Source,BG Reading (mg/dL),BG Reading (mmol/L),"
-        "Sensor Glucose (mg/dL),Sensor Glucose (mmol/L),Basal Rate (U/h)\n"
-        "0,2026-05-06,11:30:00,Meter,180,10.0,200,11.1,0.85\n"
+def test_carelink_mmol_glucose_drops_outside_inclusive_mgdl_bounds():
+    csv_text = "\n".join(
+        [
+            "Index;Date;Time;BG Reading (mmol/L);Sensor Glucose (mmol/L)",
+            "0;2026-05-06;11:30:00;1,0;1,11",
+            "1;2026-05-06;11:35:00;27,75;27,8",
+            "2;2026-05-06;11:40:00;NaN;inf",
+        ]
     )
-    messages: list[str] = []
-    sink_id = logger.add(lambda m: messages.append(str(m)), level="WARNING")
-    try:
-        export = parse_carelink_csv(csv_text)
-    finally:
-        logger.remove(sink_id)
 
-    assert export.section_count == 1
-    row = export.rows[0]
-    assert row.bg_mgdl is None
-    assert row.sensor_glucose_mgdl is None
-    # Non-glucose fields survive the glucose-only skip.
-    assert row.basal_rate_uh == 0.85
-    # The skip is announced so an operator can see a section was partially dropped.
-    assert any("mmol/L headers" in m for m in messages)
+    low, high, non_finite = parse_carelink_csv(csv_text).rows
+    assert low.bg_mgdl is None  # 18 mg/dL, dropped rather than clamped
+    assert low.sensor_glucose_mgdl == 20
+    assert high.bg_mgdl == 500
+    assert high.sensor_glucose_mgdl is None  # 501 mg/dL, dropped rather than clamped
+    assert non_finite.bg_mgdl is None
+    assert non_finite.sensor_glucose_mgdl is None
 
 
 def test_carelink_mgdl_header_still_works():
@@ -372,3 +400,16 @@ def test_carelink_mgdl_header_still_works():
     assert export.section_count == 1
     assert export.rows[0].bg_mgdl == 120
     assert export.rows[0].sensor_glucose_mgdl == 145
+
+
+def test_carelink_mgdl_bounds_are_dropped_not_clamped():
+    csv_text = (
+        "Index,Date,Time,BG Reading (mg/dL),Sensor Glucose (mg/dL)\n"
+        "0,2026-05-06,11:30:00,19,20\n"
+        "1,2026-05-06,11:35:00,500,501\n"
+    )
+    low, high = parse_carelink_csv(csv_text).rows
+    assert low.bg_mgdl is None
+    assert low.sensor_glucose_mgdl == 20
+    assert high.bg_mgdl == 500
+    assert high.sensor_glucose_mgdl is None

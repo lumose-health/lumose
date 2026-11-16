@@ -26,13 +26,20 @@ reportStatus *response* body. These are marked inline.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlparse
 
 import httpx
+
+from src.logging_config import get_logger
+from src.observability import scrub_text
+
+logger = get_logger(__name__)
 
 #: Max retries on HTTP 429 (rate limit) before giving up.
 _MAX_RETRIES_429 = 3
@@ -50,6 +57,54 @@ US_BASE_URL = "https://carelink.minimed.com"
 #: bearer to an arbitrary host (SSRF / credential exfiltration). Medtronic
 #: CareLink hosts live under minimed.com (US) / minimed.eu (EU regional).
 _ALLOWED_HOST_SUFFIXES = ("minimed.com", "minimed.eu")
+
+# CareLink error bodies can explain a rejected request, but they are controlled
+# by a third party and may echo submitted account or report data. Keep only a
+# small diagnostic vocabulary and redact every other value before logging.
+_ERROR_BODY_READ_LIMIT = 4096
+_ERROR_BODY_LOG_LIMIT = 500
+_DIAGNOSTIC_ERROR_KEYS = frozenset(
+    {"code", "detail", "error", "field", "message", "reason", "status", "title", "type"}
+)
+_SENSITIVE_ERROR_KEY_PARTS = (
+    "account",
+    "authorization",
+    "cookie",
+    "data",
+    "email",
+    "id",
+    "name",
+    "patient",
+    "report",
+    "token",
+)
+_SENSITIVE_ERROR_TEXT = re.compile(
+    r"(?i)\b(?:account|authorization|cookie|email|name|patient|token)\b"
+)
+_SAFE_DIAGNOSTIC_WORDS = frozenset(
+    {
+        "access",
+        "body",
+        "clienttime",
+        "denied",
+        "error",
+        "field",
+        "forbidden",
+        "format",
+        "in",
+        "invalid",
+        "is",
+        "json",
+        "malformed",
+        "missing",
+        "not",
+        "request",
+        "required",
+        "unauthorized",
+        "unsupported",
+        "value",
+    }
+)
 
 BearerProvider = Callable[[], Awaitable[str]]
 
@@ -107,6 +162,115 @@ def _first(d: dict, *keys: str) -> object | None:
     return None
 
 
+def _is_sensitive_error_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return any(part in normalized for part in _SENSITIVE_ERROR_KEY_PARTS)
+
+
+def _collect_sensitive_error_values(value: object) -> set[str]:
+    """Collect values attached to sensitive keys so echoes can be removed too."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if _is_sensitive_error_key(str(key)) and isinstance(
+                child, (str, int, float)
+            ):
+                rendered = str(child).strip()
+                if rendered:
+                    found.add(rendered)
+            else:
+                found.update(_collect_sensitive_error_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(_collect_sensitive_error_values(child))
+    return found
+
+
+def _sanitize_error_text(value: str, sensitive_values: set[str]) -> str:
+    text = " ".join(value.split())
+    for sensitive in sorted(sensitive_values, key=len, reverse=True):
+        text = text.replace(sensitive, "[redacted]")
+    text = scrub_text(text)
+    if _SENSITIVE_ERROR_TEXT.search(text):
+        return "[redacted]"
+    # Numeric body values could be glucose/report data or short account ids.
+    # The HTTP status is logged separately, so numbers are not needed here.
+    text = re.sub(r"\d+(?:[.,]\d+)?", "[number]", text)
+    words = re.findall(r"[A-Za-z]+", text)
+    if any(word.lower() not in _SAFE_DIAGNOSTIC_WORDS for word in words):
+        return "[redacted]"
+    return text
+
+
+def _sanitize_error_value(
+    value: object, sensitive_values: set[str], *, depth: int = 0
+) -> object:
+    if depth >= 3:
+        return "[redacted]"
+    if isinstance(value, dict):
+        sanitized: dict[str, object] = {}
+        for key, child in list(value.items())[:20]:
+            rendered_key = str(key)
+            if _is_sensitive_error_key(rendered_key):
+                sanitized[rendered_key] = "[redacted]"
+            elif rendered_key.lower() in _DIAGNOSTIC_ERROR_KEYS:
+                sanitized[rendered_key] = _sanitize_error_value(
+                    child, sensitive_values, depth=depth + 1
+                )
+            else:
+                # Preserve the body shape for diagnosis, never an unknown value.
+                sanitized[rendered_key] = "[redacted]"
+        return sanitized
+    if isinstance(value, list):
+        return [
+            _sanitize_error_value(child, sensitive_values, depth=depth + 1)
+            for child in value[:5]
+        ]
+    if isinstance(value, str):
+        return _sanitize_error_text(value, sensitive_values)
+    if value is None or isinstance(value, bool):
+        return value
+    return "[number]" if isinstance(value, (int, float)) else "[redacted]"
+
+
+def _safe_error_body(resp: httpx.Response) -> str:
+    """Return a bounded, scrubbed representation of a 4xx response body."""
+    try:
+        raw = resp.text
+    except (ValueError, UnicodeDecodeError):
+        return "[unreadable body]"
+    if not raw.strip():
+        return ""
+    if len(raw) > _ERROR_BODY_READ_LIMIT:
+        return "[oversized body redacted]"
+
+    content_type = resp.headers.get("content-type", "").lower()
+    if "text/csv" in content_type or raw.lstrip().startswith(
+        ("Index,Date", "Index;Date")
+    ):
+        return "[report body redacted]"
+
+    try:
+        parsed: object = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Free text has no field boundary from which to identify a person name
+        # or short account id reliably. Fail closed; JSON strings still parse
+        # above and pass through the normal scrubber.
+        return "[non-JSON body redacted]"
+    else:
+        sensitive_values = _collect_sensitive_error_values(parsed)
+        sanitized = _sanitize_error_value(parsed, sensitive_values)
+
+    rendered = (
+        sanitized
+        if isinstance(sanitized, str)
+        else json.dumps(sanitized, ensure_ascii=True, separators=(",", ":"))
+    )
+    if len(rendered) > _ERROR_BODY_LOG_LIMIT:
+        return rendered[:_ERROR_BODY_LOG_LIMIT] + " [truncated]"
+    return rendered
+
+
 class CareLinkClient:
     def __init__(
         self,
@@ -126,6 +290,7 @@ class CareLinkClient:
             )
         self._bearer_provider = bearer_provider
         self._base_url = base_url.rstrip("/")
+        self._is_eu_host = host == "minimed.eu" or host.endswith(".minimed.eu")
         self._poll_interval = poll_interval_seconds
         self._poll_max_attempts = poll_max_attempts
         self._owns_client = client is None
@@ -156,6 +321,14 @@ class CareLinkClient:
         }
 
     def _check(self, resp: httpx.Response) -> None:
+        if 400 <= resp.status_code < 500:
+            logger.warning(
+                "CareLink request rejected",
+                method=resp.request.method,
+                path=resp.request.url.path,
+                status=resp.status_code,
+                response_body=_safe_error_body(resp),
+            )
         if resp.status_code in (401, 403):
             raise CareLinkAuthError(
                 f"CareLink auth failed ({resp.status_code}); session invalid/expired"
@@ -167,17 +340,25 @@ class CareLinkClient:
             )
 
     async def _request(
-        self, method: str, path: str, *, json: dict | None = None, **kwargs: object
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
+        **kwargs: object,
     ) -> httpx.Response:
         """Issue a request with retry on 429 (backoff, honoring Retry-After)
         and a single retry on 5xx. 401/403 and other 4xx are not retried."""
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES_429 + 1):
             try:
+                headers = await self._headers()
+                headers.update(extra_headers or {})
                 resp = await self._client.request(
                     method,
                     f"{self._base_url}{path}",
-                    headers=await self._headers(),
+                    headers=headers,
                     json=json,
                     **kwargs,
                 )
@@ -210,13 +391,24 @@ class CareLinkClient:
         return await self._request("GET", path, **kwargs)
 
     async def _post(self, path: str, *, json: dict) -> httpx.Response:
-        return await self._request("POST", path, json=json)
+        extra_headers = (
+            {"Content-Type": "application/json; charset=UTF-8"}
+            if self._is_eu_host
+            else None
+        )
+        return await self._request("POST", path, json=json, extra_headers=extra_headers)
 
     async def get_patient_id(self) -> str:
         """Fetch the patient/account id required by generateReport."""
         data = self._json(await self._get("/patient/users/me"))
-        # Response field name unconfirmed live -- accept the likely candidates.
-        pid = _first(data, "patientId", "accountId", "loginId", "id")
+        # EU/OUS returns both ``id`` and ``accountId``; generateReport requires
+        # ``id``. Preserve the confirmed-US fallback order byte-for-byte.
+        keys = (
+            ("patientId", "id", "loginId", "accountId")
+            if self._is_eu_host
+            else ("patientId", "accountId", "loginId", "id")
+        )
+        pid = _first(data, *keys)
         if pid is None:
             raise CareLinkError("Could not find patient id in /patient/users/me")
         return str(pid)
@@ -252,7 +444,11 @@ class CareLinkClient:
         budget, CareLinkAuthError on 401/403, CareLinkError otherwise.
         """
         body = self._build_generate_report_body(
-            patient_id, start_date, end_date, client_time
+            patient_id,
+            start_date,
+            end_date,
+            client_time,
+            eu_format=self._is_eu_host,
         )
         gen = self._json(await self._post("/patient/reports/generateReport", json=body))
         uuid = _first(gen, "uuid", "reportUuid", "id")
@@ -300,11 +496,17 @@ class CareLinkClient:
         start_date: date,
         end_date: date,
         client_time: datetime | None = None,
+        *,
+        eu_format: bool = False,
     ) -> dict:
-        """Mirror the observed generateReport body: CSV only, all PDF report
-        sections off, aggregated CSV enabled."""
-        return {
-            "clientTime": (client_time or datetime.now(UTC)).isoformat(),
+        """Build the confirmed US body or the EU browser's CSV body."""
+        now = client_time or (
+            datetime.now().astimezone() if eu_format else datetime.now(UTC)
+        )
+        body = {
+            "clientTime": (
+                now.isoformat(timespec="seconds") if eu_format else now.isoformat()
+            ),
             "dailyDetailReportDays": [],
             "patientId": patient_id,
             "reportFileFormat": "CSV",
@@ -324,6 +526,35 @@ class CareLinkClient:
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
         }
+        if not eu_format:
+            return body
+
+        span_days = max((end_date - start_date).days + 1, 1)
+        body["dailyDetailReportDays"] = [
+            (end_date - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(span_days)
+        ]
+        period_b_end = start_date - timedelta(days=1)
+        period_b_start = period_b_end - timedelta(days=span_days - 1)
+        body.update(
+            {
+                "startDatePeriodB": period_b_start.strftime("%Y-%m-%d"),
+                "endDatePeriodB": period_b_end.strftime("%Y-%m-%d"),
+                "reportShowAdherence": True,
+                "reportShowAssessmentAndProgress": True,
+                "reportShowBolusWizardFoodBolus": True,
+                "reportShowDashBoard": True,
+                "reportShowDataTable": False,
+                "reportShowDeviceSettings": True,
+                "reportShowEpisodeSummary": True,
+                "reportShowInsulinAssessment": False,
+                "reportShowLogbook": True,
+                "reportShowOverview": True,
+                "reportShowSettingsHistory": False,
+                "reportShowWeeklyReview": True,
+            }
+        )
+        return body
 
     @staticmethod
     def _is_report_ready(resp: httpx.Response) -> bool:

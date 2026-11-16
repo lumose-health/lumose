@@ -362,9 +362,6 @@ def test_carelink_eu_mmol_sections_convert_and_keep_decimal_comma_events():
     eu, us = export.rows
     assert eu.bg_mgdl == 130
     assert eu.sensor_glucose_mgdl == 110
-    # The populated mg/dL-named values in the mmol section were distrusted.
-    assert eu.bg_mgdl != 499
-    assert eu.sensor_glucose_mgdl != 498
     assert eu.bolus_delivered_u == 1.5
     assert eu.carb_input_g == 42.5
     assert us.bg_mgdl == 120
@@ -375,18 +372,18 @@ def test_carelink_mmol_glucose_drops_outside_inclusive_mgdl_bounds():
     csv_text = "\n".join(
         [
             "Index;Date;Time;BG Reading (mmol/L);Sensor Glucose (mmol/L)",
-            "0;2026-05-06;11:30:00;1,0;1,11",
-            "1;2026-05-06;11:35:00;27,75;27,8",
+            "0;2026-05-06;11:30:00;1,10;1,12",
+            "1;2026-05-06;11:35:00;27,75;27,76",
             "2;2026-05-06;11:40:00;NaN;inf",
             "3;2026-05-06;11:45:00;1e308;7,2",
         ]
     )
 
     low, high, non_finite, overflow = parse_carelink_csv(csv_text).rows
-    assert low.bg_mgdl is None  # 18 mg/dL, dropped rather than clamped
+    assert low.bg_mgdl is None  # 19.8 mg/dL, dropped before rounding
     assert low.sensor_glucose_mgdl == 20
     assert high.bg_mgdl == 500
-    assert high.sensor_glucose_mgdl is None  # 501 mg/dL, dropped rather than clamped
+    assert high.sensor_glucose_mgdl is None  # 500.1 mg/dL, dropped before rounding
     assert non_finite.bg_mgdl is None
     assert non_finite.sensor_glucose_mgdl is None
     assert overflow.bg_mgdl is None
@@ -408,8 +405,8 @@ def test_carelink_mgdl_header_still_works():
 def test_carelink_mgdl_bounds_are_dropped_not_clamped():
     csv_text = (
         "Index,Date,Time,BG Reading (mg/dL),Sensor Glucose (mg/dL)\n"
-        "0,2026-05-06,11:30:00,19,20\n"
-        "1,2026-05-06,11:35:00,500,501\n"
+        "0,2026-05-06,11:30:00,19.8,20\n"
+        "1,2026-05-06,11:35:00,500,500.1\n"
     )
     low, high = parse_carelink_csv(csv_text).rows
     assert low.bg_mgdl is None

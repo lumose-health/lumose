@@ -84,6 +84,7 @@ _SENSITIVE_ERROR_TEXT = re.compile(
 _SAFE_DIAGNOSTIC_WORDS = frozenset(
     {
         "access",
+        "at",
         "body",
         "clienttime",
         "denied",
@@ -98,6 +99,9 @@ _SAFE_DIAGNOSTIC_WORDS = frozenset(
         "malformed",
         "missing",
         "not",
+        "number",
+        "position",
+        "redacted",
         "request",
         "required",
         "unauthorized",
@@ -250,14 +254,17 @@ def _safe_error_body(resp: httpx.Response) -> str:
 
     try:
         parsed: object = json.loads(raw)
+        sensitive_values = _collect_sensitive_error_values(parsed)
+        sanitized = _sanitize_error_value(parsed, sensitive_values)
     except (json.JSONDecodeError, TypeError):
         # Free text has no field boundary from which to identify a person name
         # or short account id reliably. Fail closed; JSON strings still parse
         # above and pass through the normal scrubber.
         return "[non-JSON body redacted]"
-    else:
-        sensitive_values = _collect_sensitive_error_values(parsed)
-        sanitized = _sanitize_error_value(parsed, sensitive_values)
+    except Exception:
+        # Third-party bodies are untrusted diagnostic input. Parsing or
+        # sanitizing them must never replace the intended CareLink exception.
+        return "[unparseable body]"
 
     rendered = (
         sanitized

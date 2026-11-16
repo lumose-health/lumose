@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -168,6 +168,36 @@ def test_generate_report_body_matches_eu_browser_shape():
     }
 
 
+def test_generate_report_body_handles_one_day_eu_range():
+    body = CareLinkClient._build_generate_report_body(
+        patient_id="eu-report-id",
+        start_date=date(2026, 11, 2),
+        end_date=date(2026, 11, 2),
+        client_time=datetime(2026, 11, 2, 12, tzinfo=UTC),
+        eu_format=True,
+    )
+
+    assert body["dailyDetailReportDays"] == ["2026-11-02"]
+    assert body["startDatePeriodB"] == "2026-11-01"
+    assert body["endDatePeriodB"] == "2026-11-01"
+
+
+def test_generate_report_body_defaults_to_local_second_precision_for_eu():
+    before = datetime.now().astimezone()
+    body = CareLinkClient._build_generate_report_body(
+        patient_id="eu-report-id",
+        start_date=date(2026, 11, 2),
+        end_date=date(2026, 11, 2),
+        eu_format=True,
+    )
+    after = datetime.now().astimezone()
+
+    client_time = datetime.fromisoformat(body["clientTime"])
+    assert client_time.microsecond == 0
+    assert client_time.utcoffset() == before.utcoffset()
+    assert before.replace(microsecond=0) <= client_time <= after.replace(microsecond=0)
+
+
 async def test_eu_generate_report_uses_charset_content_type():
     captured: dict[str, str] = {}
 
@@ -267,7 +297,7 @@ async def test_4xx_logs_diagnostic_body_with_sensitive_values_scrubbed(caplog):
         return httpx.Response(
             400,
             json={
-                "message": "Malformed JSON in request body",
+                "message": "Malformed JSON in request body at position 12",
                 "field": "clientTime",
                 "detail": "Fixture Person used fixture-token-value",
                 "patientId": "patient-fixture-id",
@@ -288,7 +318,7 @@ async def test_4xx_logs_diagnostic_body_with_sensitive_values_scrubbed(caplog):
 
     record = next(r for r in caplog.records if r.message == "CareLink request rejected")
     logged = record.extra_fields["response_body"]
-    assert "Malformed JSON in request body" in logged
+    assert "Malformed JSON in request body at position [number]" in logged
     assert "clientTime" in logged
     assert "patient-fixture-id" not in logged
     assert "account-fixture-id" not in logged
@@ -296,6 +326,28 @@ async def test_4xx_logs_diagnostic_body_with_sensitive_values_scrubbed(caplog):
     assert "fixture-token-value" not in logged
     assert "Sensor Glucose" not in logged
     assert "[redacted]" in logged
+
+
+async def test_4xx_deeply_nested_json_does_not_escape_diagnostic_logging(caplog):
+    nested_body = "[" * 2000 + "]" * 2000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            content=nested_body,
+            headers={"content-type": "application/json"},
+        )
+
+    caplog.set_level(
+        logging.WARNING,
+        logger="src.services.integrations.medtronic.client",
+    )
+    async with _make_client(handler) as client:
+        with pytest.raises(CareLinkError):
+            await client.get_patient_id()
+
+    record = next(r for r in caplog.records if r.message == "CareLink request rejected")
+    assert record.extra_fields["response_body"] == "[unparseable body]"
 
 
 async def test_4xx_oversized_body_is_not_logged(caplog):

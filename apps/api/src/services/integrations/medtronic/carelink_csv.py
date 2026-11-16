@@ -154,10 +154,9 @@ def _parse_glucose_mgdl(value: str | None, *, is_mmol: bool) -> int | None:
     converted_float = parsed * MGDL_PER_MMOL if is_mmol else parsed
     if not math.isfinite(converted_float):
         return None
-    converted = int(round(converted_float))
-    if not MIN_GLUCOSE_MGDL <= converted <= MAX_GLUCOSE_MGDL:
+    if not MIN_GLUCOSE_MGDL <= converted_float <= MAX_GLUCOSE_MGDL:
         return None
-    return converted
+    return int(round(converted_float))
 
 
 def _parse_timestamp(date_s: str | None, time_s: str | None) -> datetime | None:

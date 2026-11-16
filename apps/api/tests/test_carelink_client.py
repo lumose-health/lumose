@@ -332,7 +332,29 @@ async def test_4xx_unstructured_body_is_fully_redacted(caplog):
 
 async def test_4xx_json_message_with_unkeyed_identity_is_redacted(caplog):
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"message": "Fixture Person rejected"})
+        return httpx.Response(
+            400,
+            json={
+                "message": "Fixture Person rejected",
+                "fixture-person-id": "invalid",
+            },
+        )
+
+    caplog.set_level(
+        logging.WARNING,
+        logger="src.services.integrations.medtronic.client",
+    )
+    async with _make_client(handler) as client:
+        with pytest.raises(CareLinkError):
+            await client.get_patient_id()
+
+    record = next(r for r in caplog.records if r.message == "CareLink request rejected")
+    assert record.extra_fields["response_body"] == '{"message":"[redacted]"}'
+
+
+async def test_4xx_json_message_with_non_latin_identity_is_redacted(caplog):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"message": "王小明"})
 
     caplog.set_level(
         logging.WARNING,

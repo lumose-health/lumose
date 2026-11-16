@@ -378,16 +378,19 @@ def test_carelink_mmol_glucose_drops_outside_inclusive_mgdl_bounds():
             "0;2026-05-06;11:30:00;1,0;1,11",
             "1;2026-05-06;11:35:00;27,75;27,8",
             "2;2026-05-06;11:40:00;NaN;inf",
+            "3;2026-05-06;11:45:00;1e308;7,2",
         ]
     )
 
-    low, high, non_finite = parse_carelink_csv(csv_text).rows
+    low, high, non_finite, overflow = parse_carelink_csv(csv_text).rows
     assert low.bg_mgdl is None  # 18 mg/dL, dropped rather than clamped
     assert low.sensor_glucose_mgdl == 20
     assert high.bg_mgdl == 500
     assert high.sensor_glucose_mgdl is None  # 501 mg/dL, dropped rather than clamped
     assert non_finite.bg_mgdl is None
     assert non_finite.sensor_glucose_mgdl is None
+    assert overflow.bg_mgdl is None
+    assert overflow.sensor_glucose_mgdl == 130
 
 
 def test_carelink_mgdl_header_still_works():

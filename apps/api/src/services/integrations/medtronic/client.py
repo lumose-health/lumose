@@ -196,7 +196,7 @@ def _sanitize_error_text(value: str, sensitive_values: set[str]) -> str:
     # Numeric body values could be glucose/report data or short account ids.
     # The HTTP status is logged separately, so numbers are not needed here.
     text = re.sub(r"\d+(?:[.,]\d+)?", "[number]", text)
-    words = re.findall(r"[A-Za-z]+", text)
+    words = re.findall(r"[^\W\d_]+", text)
     if any(word.lower() not in _SAFE_DIAGNOSTIC_WORDS for word in words):
         return "[redacted]"
     return text
@@ -211,15 +211,13 @@ def _sanitize_error_value(
         sanitized: dict[str, object] = {}
         for key, child in list(value.items())[:20]:
             rendered_key = str(key)
-            if _is_sensitive_error_key(rendered_key):
-                sanitized[rendered_key] = "[redacted]"
-            elif rendered_key.lower() in _DIAGNOSTIC_ERROR_KEYS:
+            if (
+                rendered_key.lower() in _DIAGNOSTIC_ERROR_KEYS
+                and not _is_sensitive_error_key(rendered_key)
+            ):
                 sanitized[rendered_key] = _sanitize_error_value(
                     child, sensitive_values, depth=depth + 1
                 )
-            else:
-                # Preserve the body shape for diagnosis, never an unknown value.
-                sanitized[rendered_key] = "[redacted]"
         return sanitized
     if isinstance(value, list):
         return [

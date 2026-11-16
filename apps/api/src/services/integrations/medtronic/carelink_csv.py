@@ -151,7 +151,10 @@ def _parse_glucose_mgdl(value: str | None, *, is_mmol: bool) -> int | None:
     parsed = _parse_float(value)
     if parsed is None or not math.isfinite(parsed):
         return None
-    converted = int(round(parsed * MGDL_PER_MMOL if is_mmol else parsed))
+    converted_float = parsed * MGDL_PER_MMOL if is_mmol else parsed
+    if not math.isfinite(converted_float):
+        return None
+    converted = int(round(converted_float))
     if not MIN_GLUCOSE_MGDL <= converted <= MAX_GLUCOSE_MGDL:
         return None
     return converted

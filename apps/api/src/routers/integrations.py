@@ -171,6 +171,12 @@ from src.schemas.pump import (
     TandemSyncSettingsRequest,
     TandemSyncStatusResponse,
 )
+from src.services.basal_estimation import (
+    MAX_BASAL_RATE,
+    BasalEvent,
+    BasalEventKind,
+    estimate_basal_delivery,
+)
 from src.services.cgm_source import (
     CGM_ROLE_PRIMARY,
     default_cgm_role_for_new_source,
@@ -238,6 +244,7 @@ from src.services.pump_event_dedupe import (
     compute_pump_event_dedupe_hash,
     nightscout_duplicate_exclusion_sql,
 )
+from src.services.pump_profile import get_active_profile
 from src.services.tandem_sync import (
     TandemAuthError,
     TandemConnectionError,
@@ -252,6 +259,7 @@ from src.services.tandem_sync import (
     sync_tandem_for_user,
 )
 from src.services.target_glucose_range import get_or_create_range
+from src.services.user_local_time import load_user_zone, resolve_user_timezone
 
 logger = get_logger(__name__)
 
@@ -3942,8 +3950,6 @@ _MAX_BOLUS_UNITS = MAX_INSULIN_DOSE_UNITS
 # MAX_BASAL_INJECTION_UNITS). Used as the read-filter ceiling so a legitimate
 # basal injection is not clipped by the lower bolus bound.
 _MAX_BASAL_INJECTION = MAX_BASAL_INJECTION_UNITS
-# Maximum basal rate (Tandem X2/Mobi max = 15 U/hr)
-_MAX_BASAL_RATE = 15.0
 # Maximum gap between basal records before capping (handles disconnections).
 # 2 hours covers typical gaps: site changes (~30 min), sensor restarts (~2 hr
 # for Dexcom G6/G7), showers (~15 min). Longer gaps indicate true disconnection
@@ -4325,45 +4331,41 @@ async def get_insulin_summary(
     )
     bolus_rows = bolus_result.all()
 
-    # Basal: time-weighted rate integration using SQL LEAD() window
-    # function. Each basal record stores units = rate in U/hr (not
-    # delivered amount). Actual delivery = rate * time_until_next_record,
-    # capped at _BASAL_MAX_GAP_HOURS to handle pump disconnections/gaps.
-    # Uses PostgreSQL EXTRACT(EPOCH) and LEAST() -- not portable to
-    # SQLite.
-    #
-    # No source filter: any integration that writes basal-rate-change
-    # events to the canonical table contributes. Cross-source overlap
-    # (rare in practice -- a user with both Tandem cloud and Loop-via-
-    # NS reporting the same pump) produces same-timestamp rows that the
-    # LEAD ordering folds into zero-duration intervals, so the
-    # integrated total is approximately correct without explicit
-    # row-level dedupe. A precise dedupe scheme would land at write
-    # time, not in this read query.
-    _table = PumpEvent.__tablename__
+    # Basal: retain the database-side legacy aggregate so rapid-poll sources do
+    # not send hundreds of thousands of rows through Python. The query returns
+    # only intervals where stored duration or end-marker semantics differ from
+    # that aggregate; those intervals use the shared estimator from the brief.
     _basal_val = PumpEventType.BASAL.value
-    basal_query = text(  # nosemgrep: avoid-sqlalchemy-text
-        f"""
+    _suspend_val = PumpEventType.SUSPEND.value
+    _resume_val = PumpEventType.RESUME.value
+    _table = PumpEvent.__tablename__
+    basal_ctes = f"""
         WITH prior AS (
-            SELECT event_timestamp, units
+            SELECT id, event_timestamp, event_type, units, duration_minutes
             FROM {_table}
             WHERE user_id = :user_id
-              AND event_type = :event_type
-              AND units IS NOT NULL
-              AND units >= 0
-              AND units <= :max_rate
+              AND event_type IN (:basal_type, :suspend_type, :resume_type)
+              AND {ns_dedupe_sql}
               AND event_timestamp < :cutoff
-            ORDER BY event_timestamp DESC
+            ORDER BY event_timestamp DESC,
+                     CASE
+                         WHEN event_type = :suspend_type THEN 2
+                         WHEN event_type = :basal_type
+                              AND (units IS DISTINCT FROM 0
+                                   OR duration_minutes IS DISTINCT FROM 0)
+                             THEN 1
+                         ELSE 0
+                     END DESC,
+                     duration_minutes ASC NULLS LAST,
+                     id DESC
             LIMIT 1
         ),
         in_window AS (
-            SELECT event_timestamp, units
+            SELECT id, event_timestamp, event_type, units, duration_minutes
             FROM {_table}
             WHERE user_id = :user_id
-              AND event_type = :event_type
-              AND units IS NOT NULL
-              AND units >= 0
-              AND units <= :max_rate
+              AND event_type IN (:basal_type, :suspend_type, :resume_type)
+              AND {ns_dedupe_sql}
               AND event_timestamp >= :cutoff
               AND event_timestamp <= :now
         ),
@@ -4372,39 +4374,232 @@ async def get_insulin_summary(
             UNION ALL
             SELECT * FROM in_window
         ),
+        basal_ranked AS (
+            SELECT
+                id,
+                event_timestamp,
+                event_type,
+                units,
+                duration_minutes,
+                ROW_NUMBER() OVER (
+                    PARTITION BY event_timestamp
+                    ORDER BY
+                        CASE
+                            WHEN event_type = :suspend_type THEN 2
+                            WHEN event_type = :basal_type
+                                 AND (units IS DISTINCT FROM 0
+                                      OR duration_minutes IS DISTINCT FROM 0)
+                                THEN 1
+                            ELSE 0
+                        END DESC,
+                        duration_minutes ASC NULLS LAST,
+                        id DESC
+                ) AS row_rank
+            FROM basal_rows
+        ),
         basal_ordered AS (
             SELECT
+                id,
                 event_timestamp,
+                event_type,
                 units,
-                LEAD(event_timestamp) OVER (ORDER BY event_timestamp) AS next_ts
-            FROM basal_rows
+                duration_minutes,
+                LEAD(event_timestamp) OVER (ORDER BY event_timestamp, id) AS next_ts
+            FROM basal_ranked
+            WHERE row_rank = 1
+        ),
+        basal_coverage AS (
+            SELECT
+                EXISTS(SELECT 1 FROM prior) AS has_seed,
+                MIN(event_timestamp) FILTER (
+                    WHERE event_timestamp >= :cutoff
+                      AND event_timestamp < :now
+                ) AS first_in_window_ts
+            FROM basal_ordered
         )
-        SELECT COALESCE(SUM(
-            units * LEAST(
-                EXTRACT(EPOCH FROM (
-                    LEAST(COALESCE(next_ts, :now), :now)
-                    - GREATEST(event_timestamp, :cutoff)
-                )) / 3600.0,
-                :max_gap
-            )
-        ), 0) AS total_basal
-        FROM basal_ordered
-        WHERE LEAST(COALESCE(next_ts, :now), :now)
-            > GREATEST(event_timestamp, :cutoff)
     """
+    basal_params = {
+        "user_id": str(current_user.id),
+        "cutoff": cutoff,
+        "now": now,
+        "basal_type": _basal_val,
+        "suspend_type": _suspend_val,
+        "resume_type": _resume_val,
+        "max_rate": float(MAX_BASAL_RATE),
+        "max_gap": float(_BASAL_MAX_GAP_HOURS),
+    }
+    basal_query = text(  # nosemgrep: avoid-sqlalchemy-text
+        basal_ctes
+        + """
+        , basal_aggregate AS (
+            SELECT COALESCE(SUM(
+                units * CASE
+                    WHEN duration_minutes IS NULL THEN LEAST(
+                        EXTRACT(EPOCH FROM (
+                            LEAST(COALESCE(next_ts, :now), :now)
+                            - GREATEST(event_timestamp, :cutoff)
+                        )) / 3600.0,
+                        :max_gap
+                    )
+                    ELSE EXTRACT(EPOCH FROM (
+                        LEAST(COALESCE(next_ts, :now), :now)
+                        - GREATEST(event_timestamp, :cutoff)
+                    )) / 3600.0
+                END
+            ), 0) AS total_basal
+            FROM basal_ordered
+            WHERE event_type = :basal_type
+              AND units BETWEEN 0 AND :max_rate
+              AND LEAST(COALESCE(next_ts, :now), :now)
+                > GREATEST(event_timestamp, :cutoff)
+        ),
+        correction_intervals AS (
+            SELECT id, event_timestamp, event_type, units, duration_minutes, next_ts
+            FROM basal_ordered
+            WHERE LEAST(COALESCE(next_ts, :now), :now)
+                  > GREATEST(event_timestamp, :cutoff)
+              AND (
+                    event_type = :resume_type
+                    OR units IS NULL
+                    OR (
+                        event_type = :basal_type
+                        AND units IS NOT NULL
+                        AND units NOT BETWEEN 0 AND :max_rate
+                    )
+                    OR (
+                        event_type = :suspend_type
+                        AND (
+                            next_ts IS NULL
+                            OR (
+                                duration_minutes IS NOT NULL
+                                AND event_timestamp
+                                    + duration_minutes * INTERVAL '1 minute'
+                                    < LEAST(next_ts, :now)
+                            )
+                        )
+                    )
+                    OR (
+                        event_type = :basal_type
+                        AND units = 0
+                        AND duration_minutes = 0
+                    )
+                    OR (
+                        event_type = :basal_type
+                        AND units IS NOT NULL
+                        AND duration_minutes IS NOT NULL
+                        AND event_timestamp
+                            + duration_minutes * INTERVAL '1 minute'
+                            < LEAST(COALESCE(next_ts, :now), :now)
+                    )
+              )
+        )
+        SELECT
+            basal_aggregate.total_basal,
+            basal_coverage.has_seed,
+            basal_coverage.first_in_window_ts,
+            correction_intervals.event_timestamp,
+            correction_intervals.event_type,
+            correction_intervals.units,
+            correction_intervals.duration_minutes,
+            correction_intervals.next_ts
+        FROM basal_aggregate
+        CROSS JOIN basal_coverage
+        LEFT JOIN correction_intervals ON TRUE
+        ORDER BY correction_intervals.event_timestamp, correction_intervals.id
+        """
     )
-    basal_result = await db.execute(
-        basal_query,
-        {
-            "user_id": str(current_user.id),
-            "cutoff": cutoff,
-            "now": now,
-            "event_type": _basal_val,
-            "max_rate": float(_MAX_BASAL_RATE),
-            "max_gap": float(_BASAL_MAX_GAP_HOURS),
-        },
+    basal_result = await db.execute(basal_query, basal_params)
+    basal_rows = basal_result.all()
+    basal_units = float(basal_rows[0].total_basal or 0.0)
+    first_in_window_ts = basal_rows[0].first_in_window_ts
+    basal_estimate_complete = not (
+        not basal_rows[0].has_seed
+        and first_in_window_ts is not None
+        and first_in_window_ts - cutoff >= timedelta(seconds=60)
     )
-    basal_units = float(basal_result.scalar() or 0.0)
+    correction_rows = [row for row in basal_rows if row.event_timestamp is not None]
+    profile_segments = None
+    profile_zone = None
+    if correction_rows:
+        profile = await get_active_profile(current_user.id, db)
+        if profile is not None:
+            profile_segments = profile.segments
+        profile_tz_name = await resolve_user_timezone(db, current_user.id)
+        profile_zone = load_user_zone(profile_tz_name, current_user.id)
+
+    corrected_events: list[BasalEvent] = []
+    legacy_events: list[BasalEvent] = []
+    for row in correction_rows:
+        interval_end = min(row.next_ts or now, now)
+        kind = BasalEventKind.BASAL
+        duration = row.duration_minutes
+        if row.event_type == _suspend_val:
+            kind = BasalEventKind.SUSPEND
+            if duration is None and row.next_ts is not None:
+                duration = max(
+                    0, int((interval_end - row.event_timestamp).total_seconds() // 60)
+                )
+        elif row.event_type == _resume_val:
+            kind = BasalEventKind.RESUME
+        elif row.units is None or not 0 <= row.units <= MAX_BASAL_RATE:
+            kind = BasalEventKind.UNKNOWN_RATE
+        elif row.units == 0 and duration == 0:
+            kind = BasalEventKind.CANCEL
+        corrected_events.append(
+            BasalEvent(
+                timestamp=row.event_timestamp,
+                rate=row.units,
+                duration_minutes=duration,
+                kind=kind,
+                interval_end=interval_end,
+            )
+        )
+        if (
+            row.event_type == _basal_val
+            and row.units is not None
+            and 0 <= row.units <= MAX_BASAL_RATE
+        ):
+            legacy_events.append(
+                BasalEvent(
+                    timestamp=row.event_timestamp,
+                    rate=row.units,
+                    duration_minutes=math.ceil(
+                        (interval_end - row.event_timestamp).total_seconds() / 60
+                    ),
+                    interval_end=interval_end,
+                )
+            )
+
+    if corrected_events:
+        corrected = estimate_basal_delivery(
+            corrected_events,
+            cutoff,
+            now,
+            profile_segments=profile_segments,
+            profile_timezone=profile_zone,
+            legacy_max_gap_hours=_BASAL_MAX_GAP_HOURS,
+            # Coverage is evaluated from the full SQL event stream above.
+            # This list contains only intervals needing Python correction.
+            require_start_coverage=False,
+        )
+        legacy = estimate_basal_delivery(
+            legacy_events,
+            cutoff,
+            now,
+            # Legacy events span their full SQL aggregate interval explicitly,
+            # so the durationless cap does not apply to this subtraction.
+            legacy_max_gap_hours=_BASAL_MAX_GAP_HOURS,
+            require_start_coverage=False,
+        )
+        basal_units += corrected.units - legacy.units
+        basal_estimate_complete = basal_estimate_complete and corrected.complete
+    if basal_units < 0:
+        logger.warning(
+            "basal summary correction produced a negative total",
+            basal_units=basal_units,
+            correction_interval_count=len(correction_rows),
+        )
+    basal_units = max(0.0, basal_units)
 
     # Long-acting (basal) pen injections (MDI -- e.g. Lantus, Tresiba). Discrete
     # injected amounts (units), NOT a rate, so they sum directly (no LEAD time
@@ -4517,7 +4712,7 @@ async def get_insulin_summary(
             "basal_type": _basal_val,
             "basal_injection_type": PumpEventType.BASAL_INJECTION.value,
             "max_bolus": float(_MAX_BOLUS_UNITS),
-            "max_rate": float(_MAX_BASAL_RATE),
+            "max_rate": float(MAX_BASAL_RATE),
             "max_injection": float(_MAX_BASAL_INJECTION),
         },
     )
@@ -4539,6 +4734,7 @@ async def get_insulin_summary(
     return InsulinSummaryResponse(
         tdd=tdd,
         basal_units=basal_avg,
+        basal_estimate_complete=basal_estimate_complete,
         basal_injection_units=basal_injection_avg,
         basal_injection_count=basal_injection_count,
         bolus_units=bolus_avg,

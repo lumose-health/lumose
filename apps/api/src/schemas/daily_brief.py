@@ -33,8 +33,10 @@ class InsulinBreakdown(BaseModel):
     basal_estimate_complete: bool = Field(
         default=True,
         description=(
-            "False when an explicit temp-basal gap could not be filled because "
-            "the scheduled profile rate was unavailable"
+            "False when stored basal data includes an unknown rate, an unbounded "
+            "suspend, or a gap of at least one minute without a known rate. Some "
+            "sources do not report every rate change, so true means complete for "
+            "the stored data"
         ),
     )
     basal_injection_units: float = Field(

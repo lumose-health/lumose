@@ -446,6 +446,15 @@ class InsulinSummaryResponse(BaseModel):
     basal_units: float = Field(
         ..., ge=0, description="Average daily basal insulin -- pump rate (units/day)"
     )
+    basal_estimate_complete: bool = Field(
+        default=True,
+        description=(
+            "False when stored basal data includes an unknown rate, an unbounded "
+            "suspend, or a gap of at least one minute without a known rate. Some "
+            "sources do not report every rate change, so true means complete for "
+            "the stored data"
+        ),
+    )
     basal_injection_units: float = Field(
         default=0.0,
         ge=0,

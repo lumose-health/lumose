@@ -1,5 +1,6 @@
 """Tests for the shared temp-basal/profile delivery estimate."""
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -424,8 +425,8 @@ def test_same_timestamp_durationless_rows_keep_highest_order():
 
     estimate = estimate_basal_delivery(
         [
-            BasalEvent(start, 1.0, order=10),
-            BasalEvent(start, 2.0, order=11),
+            BasalEvent(start, 1.0, order=uuid.UUID(int=10)),
+            BasalEvent(start, 2.0, order=uuid.UUID(int=11)),
         ],
         start,
         start + timedelta(minutes=10),
@@ -433,6 +434,34 @@ def test_same_timestamp_durationless_rows_keep_highest_order():
     )
 
     assert estimate.units == pytest.approx(2.0 * 10 / 60)
+
+
+@pytest.mark.parametrize("suspend_first", [False, True])
+def test_same_timestamp_suspend_wins_over_basal_in_both_id_orders(suspend_first):
+    start = datetime(2026, 1, 1, 10, tzinfo=UTC)
+    basal = BasalEvent(start, 1.5, order=uuid.UUID(int=1 if suspend_first else 2))
+    suspend = BasalEvent(
+        start,
+        None,
+        kind=BasalEventKind.SUSPEND,
+        order=uuid.UUID(int=2 if suspend_first else 1),
+    )
+    resume = BasalEvent(
+        start + timedelta(hours=1),
+        None,
+        kind=BasalEventKind.RESUME,
+        order=uuid.UUID(int=3),
+    )
+
+    estimate = estimate_basal_delivery(
+        [suspend, basal, resume] if suspend_first else [basal, suspend, resume],
+        start,
+        start + timedelta(hours=1),
+        legacy_max_gap_hours=2.0,
+    )
+
+    assert estimate.complete is True
+    assert estimate.units == 0
 
 
 def test_unstored_nightscout_cancel_keeps_full_stated_temp_duration():

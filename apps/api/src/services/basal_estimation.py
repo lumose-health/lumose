@@ -1,5 +1,7 @@
 """Shared basal-delivery estimation from pump events and profile schedules."""
 
+import uuid
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -31,7 +33,7 @@ class BasalEvent:
     rate: float | None
     duration_minutes: int | None = None
     kind: BasalEventKind = BasalEventKind.BASAL
-    order: int = 0
+    order: uuid.UUID = uuid.UUID(int=0)
     interval_end: datetime | None = None
 
 
@@ -167,13 +169,9 @@ def _scheduled_units(
 ) -> BasalEstimate:
     if end <= start:
         return BasalEstimate(0.0, True, False)
-    points = sorted(
-        {
-            start,
-            *(point for point in boundaries if start < point < end),
-            end,
-        }
-    )
+    first = bisect_right(boundaries, start)
+    last = bisect_left(boundaries, end, lo=first)
+    points = [start, *boundaries[first:last], end]
     units = 0.0
     complete = True
     for left, right in zip(points, points[1:], strict=False):
@@ -224,12 +222,26 @@ def estimate_basal_delivery(
         key=lambda event: (event.timestamp, event.order),
     )
     ordered: list[BasalEvent] = []
+    kind_priority = {
+        BasalEventKind.RESUME: 0,
+        BasalEventKind.CANCEL: 0,
+        BasalEventKind.BASAL: 1,
+        BasalEventKind.UNKNOWN_RATE: 1,
+        BasalEventKind.SUSPEND: 2,
+    }
     for event in ordered_with_duplicates:
         if not ordered or ordered[-1].timestamp != event.timestamp:
             ordered.append(event)
             continue
 
         current = ordered[-1]
+        current_priority = kind_priority[current.kind]
+        event_priority = kind_priority[event.kind]
+        if event_priority != current_priority:
+            if event_priority > current_priority:
+                ordered[-1] = event
+            continue
+
         current_duration = current.duration_minutes
         event_duration = event.duration_minutes
         if (

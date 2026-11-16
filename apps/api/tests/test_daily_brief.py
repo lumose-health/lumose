@@ -12,7 +12,9 @@ from src.config import settings
 from src.core.units import GlucoseUnit
 from src.main import app
 from src.models.ai_provider import AIProviderType
-from src.models.pump_data import PumpEventType
+from src.models.glucose import GlucoseReading, TrendDirection
+from src.models.pump_data import PumpEvent, PumpEventType
+from src.models.user import User
 from src.schemas.ai_response import AIResponse, AIUsage
 from src.schemas.daily_brief import DailyBriefMetrics
 from src.services.daily_brief import (
@@ -399,6 +401,91 @@ class TestCalculateMetrics:
         assert metrics.insulin_breakdown is not None
         assert metrics.insulin_breakdown.basal_units == pytest.approx(0.2)
         assert metrics.insulin_breakdown.basal_estimate_complete is False
+
+    @pytest.mark.asyncio(loop_scope="session")
+    @pytest.mark.parametrize("suspend_has_higher_id", [False, True])
+    async def test_seed_same_timestamp_suspend_wins_in_both_id_orders(
+        self,
+        db_session,
+        suspend_has_higher_id,
+    ):
+        start = datetime(2026, 1, 1, 10, tzinfo=UTC)
+        seed_timestamp = start - timedelta(minutes=5)
+        end = start + timedelta(hours=1)
+        low_id = uuid.UUID(int=1)
+        high_id = uuid.UUID(int=2)
+        suspend_id, basal_id = (
+            (high_id, low_id) if suspend_has_higher_id else (low_id, high_id)
+        )
+        user = User(
+            email=unique_email("brief-seed-tie"),
+            hashed_password="not-a-real-hash",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        db_session.add_all(
+            [
+                GlucoseReading(
+                    user_id=user.id,
+                    value=120,
+                    reading_timestamp=start,
+                    trend=TrendDirection.FLAT,
+                    trend_rate=0.0,
+                    received_at=start,
+                    source="test",
+                ),
+                PumpEvent(
+                    id=basal_id,
+                    user_id=user.id,
+                    event_type=PumpEventType.BASAL,
+                    event_timestamp=seed_timestamp,
+                    units=1.5,
+                    received_at=seed_timestamp,
+                    source="carelink",
+                ),
+                PumpEvent(
+                    id=suspend_id,
+                    user_id=user.id,
+                    event_type=PumpEventType.SUSPEND,
+                    event_timestamp=seed_timestamp,
+                    received_at=seed_timestamp,
+                    source="carelink",
+                ),
+                PumpEvent(
+                    user_id=user.id,
+                    event_type=PumpEventType.RESUME,
+                    event_timestamp=start + timedelta(minutes=30),
+                    received_at=start + timedelta(minutes=30),
+                    source="carelink",
+                ),
+            ]
+        )
+        await db_session.flush()
+        profile = SimpleNamespace(
+            segments=[
+                {
+                    "start_minutes": 0,
+                    "basal_rate": 0.6,
+                    "unknown_as_null": True,
+                }
+            ]
+        )
+
+        with (
+            patch(
+                "src.services.daily_brief.get_active_profile",
+                new=AsyncMock(return_value=profile),
+            ),
+            patch(
+                "src.services.daily_brief.resolve_user_timezone",
+                new=AsyncMock(return_value="UTC"),
+            ),
+        ):
+            metrics = await calculate_metrics(user.id, db_session, start, end)
+
+        assert metrics.insulin_breakdown is not None
+        assert metrics.insulin_breakdown.basal_units == pytest.approx(0.3)
+        assert metrics.insulin_breakdown.basal_estimate_complete is True
 
 
 class TestBuildAnalysisPrompt:

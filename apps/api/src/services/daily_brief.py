@@ -10,7 +10,7 @@ from typing import cast
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.units import (
@@ -320,6 +320,17 @@ async def calculate_metrics(
     # Fetch the last basal event BEFORE the window to seed the active rate,
     # then all in-window events. Each segment runs until the next event or
     # period_end, clamped to the window boundaries.
+    seed_kind_rank = case(
+        (PumpEvent.event_type == PumpEventType.SUSPEND, 2),
+        (
+            (PumpEvent.event_type == PumpEventType.BASAL)
+            & (PumpEvent.units == 0)
+            & (PumpEvent.duration_minutes == 0),
+            0,
+        ),
+        (PumpEvent.event_type == PumpEventType.BASAL, 1),
+        else_=0,
+    )
     seed_result = await db.execute(
         select(
             PumpEvent.id,
@@ -338,6 +349,7 @@ async def calculate_metrics(
         )
         .order_by(
             PumpEvent.event_timestamp.desc(),
+            seed_kind_rank.desc(),
             PumpEvent.duration_minutes.asc().nulls_last(),
             PumpEvent.id.desc(),
         )
@@ -392,6 +404,8 @@ async def calculate_metrics(
 
     # Nightscout cancel treatments are not stored. A temp cancelled early with
     # no following temp therefore remains active for its full stated duration.
+    # CareLink percent temps are also skipped at ingestion, so the prior stored
+    # rate continues until the next event.
     profile_segments = None
     profile_zone = None
     if any(

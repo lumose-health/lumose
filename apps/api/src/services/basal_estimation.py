@@ -191,6 +191,7 @@ def estimate_basal_delivery(
     profile_segments: list[dict[str, object]] | None = None,
     profile_timezone: ZoneInfo | None = None,
     legacy_max_gap_hours: float,
+    require_start_coverage: bool = True,
 ) -> BasalEstimate:
     """Estimate basal delivery for a reporting window.
 
@@ -201,6 +202,9 @@ def estimate_basal_delivery(
     the active profile. Missing/unknown scheduled rates leave the numeric
     result partial and set ``complete`` false instead of treating unknown as
     zero. A real scheduled 0 U/h remains a known zero.
+
+    ``require_start_coverage`` is disabled only when a caller has already
+    checked coverage against a broader event stream.
     """
     start = _utc(period_start)
     end = _utc(period_end)
@@ -260,6 +264,26 @@ def estimate_basal_delivery(
     units = 0.0
     complete = True
     evaluated = False
+
+    first_interval_start = next(
+        (
+            max(event.timestamp, start)
+            for index, event in enumerate(ordered)
+            if min(
+                event.interval_end
+                or (ordered[index + 1].timestamp if index + 1 < len(ordered) else end),
+                end,
+            )
+            > max(event.timestamp, start)
+        ),
+        None,
+    )
+    if (
+        require_start_coverage
+        and first_interval_start is not None
+        and first_interval_start - start >= timedelta(seconds=60)
+    ):
+        complete = False
 
     for index, event in enumerate(ordered):
         interval_start = max(event.timestamp, start)

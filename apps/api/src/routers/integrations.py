@@ -4407,6 +4407,15 @@ async def get_insulin_summary(
                 LEAD(event_timestamp) OVER (ORDER BY event_timestamp, id) AS next_ts
             FROM basal_ranked
             WHERE row_rank = 1
+        ),
+        basal_coverage AS (
+            SELECT
+                EXISTS(SELECT 1 FROM prior) AS has_seed,
+                MIN(event_timestamp) FILTER (
+                    WHERE event_timestamp >= :cutoff
+                      AND event_timestamp < :now
+                ) AS first_in_window_ts
+            FROM basal_ordered
         )
     """
     basal_params = {
@@ -4486,12 +4495,15 @@ async def get_insulin_summary(
         )
         SELECT
             basal_aggregate.total_basal,
+            basal_coverage.has_seed,
+            basal_coverage.first_in_window_ts,
             correction_intervals.event_timestamp,
             correction_intervals.event_type,
             correction_intervals.units,
             correction_intervals.duration_minutes,
             correction_intervals.next_ts
         FROM basal_aggregate
+        CROSS JOIN basal_coverage
         LEFT JOIN correction_intervals ON TRUE
         ORDER BY correction_intervals.event_timestamp, correction_intervals.id
         """
@@ -4499,6 +4511,12 @@ async def get_insulin_summary(
     basal_result = await db.execute(basal_query, basal_params)
     basal_rows = basal_result.all()
     basal_units = float(basal_rows[0].total_basal or 0.0)
+    first_in_window_ts = basal_rows[0].first_in_window_ts
+    basal_estimate_complete = not (
+        not basal_rows[0].has_seed
+        and first_in_window_ts is not None
+        and first_in_window_ts - cutoff >= timedelta(seconds=60)
+    )
     correction_rows = [row for row in basal_rows if row.event_timestamp is not None]
     profile_segments = None
     profile_zone = None
@@ -4552,7 +4570,6 @@ async def get_insulin_summary(
                 )
             )
 
-    basal_estimate_complete = True
     if corrected_events:
         corrected = estimate_basal_delivery(
             corrected_events,
@@ -4561,6 +4578,9 @@ async def get_insulin_summary(
             profile_segments=profile_segments,
             profile_timezone=profile_zone,
             legacy_max_gap_hours=_BASAL_MAX_GAP_HOURS,
+            # Coverage is evaluated from the full SQL event stream above.
+            # This list contains only intervals needing Python correction.
+            require_start_coverage=False,
         )
         legacy = estimate_basal_delivery(
             legacy_events,
@@ -4569,9 +4589,10 @@ async def get_insulin_summary(
             # Legacy events span their full SQL aggregate interval explicitly,
             # so the durationless cap does not apply to this subtraction.
             legacy_max_gap_hours=_BASAL_MAX_GAP_HOURS,
+            require_start_coverage=False,
         )
         basal_units += corrected.units - legacy.units
-        basal_estimate_complete = corrected.complete
+        basal_estimate_complete = basal_estimate_complete and corrected.complete
     if basal_units < 0:
         logger.warning(
             "basal summary correction produced a negative total",

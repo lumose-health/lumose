@@ -268,6 +268,56 @@ def test_seed_temp_crossing_window_start_uses_remaining_duration():
     assert estimate.units == pytest.approx(2.0 * 5 / 60 + 0.6 * 10 / 60)
 
 
+@pytest.mark.parametrize(
+    ("gap_seconds", "expected_complete"),
+    [(59, True), (60, False), (10 * 60, False)],
+)
+def test_leading_gap_threshold_without_profile_fill(gap_seconds, expected_complete):
+    window_start = datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+    estimate = estimate_basal_delivery(
+        [BasalEvent(window_start + timedelta(seconds=gap_seconds), 1.0)],
+        window_start,
+        window_start + timedelta(minutes=30),
+        profile_segments=[_segment(0, 0.6)],
+        legacy_max_gap_hours=2.0,
+    )
+
+    assert estimate.evaluated is True
+    assert estimate.complete is expected_complete
+    assert estimate.units == pytest.approx((30 * 60 - gap_seconds) / 3600)
+
+
+def test_pre_window_seed_avoids_leading_gap():
+    window_start = datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+    estimate = estimate_basal_delivery(
+        [BasalEvent(window_start - timedelta(minutes=10), 1.0)],
+        window_start,
+        window_start + timedelta(minutes=30),
+        legacy_max_gap_hours=2.0,
+    )
+
+    assert estimate.evaluated is True
+    assert estimate.complete is True
+    assert estimate.units == pytest.approx(0.5)
+
+
+def test_empty_window_is_not_evaluated():
+    window_start = datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+    estimate = estimate_basal_delivery(
+        [],
+        window_start,
+        window_start + timedelta(minutes=30),
+        legacy_max_gap_hours=2.0,
+    )
+
+    assert estimate.evaluated is False
+    assert estimate.complete is True
+    assert estimate.units == 0
+
+
 def test_expired_unknown_seed_does_not_mark_window_incomplete():
     window_start = datetime(2026, 1, 1, 10, tzinfo=UTC)
 

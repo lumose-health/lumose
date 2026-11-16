@@ -449,8 +449,10 @@ class InsulinSummaryResponse(BaseModel):
     basal_estimate_complete: bool = Field(
         default=True,
         description=(
-            "False when basal delivery includes an unknown rate, a percent temp, "
-            "an unbounded suspend, or a gap with no known scheduled profile rate"
+            "False when stored basal data includes an unknown rate, an unbounded "
+            "suspend, or a gap of at least one minute without a known rate. Some "
+            "sources do not report every rate change, so true means complete for "
+            "the stored data"
         ),
     )
     basal_injection_units: float = Field(

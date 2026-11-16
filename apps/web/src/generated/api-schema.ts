@@ -6853,7 +6853,7 @@ export interface components {
         InsulinSummaryResponse: {
             /**
              * Basal Estimate Complete
-             * @description False when basal delivery includes an unknown rate, a percent temp, an unbounded suspend, or a gap with no known scheduled profile rate
+             * @description False when stored basal data includes an unknown rate, an unbounded suspend, or a gap of at least one minute without a known rate. Some sources do not report every rate change, so true means complete for the stored data
              * @default true
              */
             basal_estimate_complete: boolean;

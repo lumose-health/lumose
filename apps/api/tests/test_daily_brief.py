@@ -412,8 +412,9 @@ class TestCalculateMetrics:
         start = datetime(2026, 1, 1, 10, tzinfo=UTC)
         seed_timestamp = start - timedelta(minutes=5)
         end = start + timedelta(hours=1)
-        low_id = uuid.UUID(int=1)
-        high_id = uuid.UUID(int=2)
+        id_base = uuid.uuid4().int & ~0b11
+        low_id = uuid.UUID(int=id_base)
+        high_id = uuid.UUID(int=id_base + 1)
         suspend_id, basal_id = (
             (high_id, low_id) if suspend_has_higher_id else (low_id, high_id)
         )

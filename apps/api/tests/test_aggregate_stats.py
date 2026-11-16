@@ -481,7 +481,7 @@ class TestInsulinSummary:
 
     @pytest.mark.parametrize(
         ("profile_rate", "expected_basal", "expected_complete"),
-        [(0.8, 0.6, True), (1000.0, 0.1, False)],
+        [(0.8, 0.6, False), (1000.0, 0.1, False)],
     )
     async def test_temp_basal_uses_duration_then_scheduled_rate(
         self,
@@ -858,6 +858,96 @@ class TestInsulinSummary:
         )
         assert brief.insulin_breakdown.basal_estimate_complete is False
         assert summary["basal_estimate_complete"] is False
+
+    @pytest.mark.parametrize(
+        (
+            "scenario",
+            "expected_brief_units",
+            "expected_summary_units",
+            "expected_complete",
+            "expected_evaluated",
+        ),
+        [
+            ("leading_gap", 0.3, 8.0, False, True),
+            ("seed", 0.5, 0.5, True, True),
+            ("empty", 0.0, 0.0, True, False),
+        ],
+    )
+    async def test_basal_window_start_coverage_agrees_between_brief_and_summary(
+        self,
+        scenario,
+        expected_brief_units,
+        expected_summary_units,
+        expected_complete,
+        expected_evaluated,
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            cookie, user_id = await register_and_login(client)
+            start = datetime.now(UTC) - timedelta(days=2)
+            end = start + timedelta(minutes=30)
+            uid = uuid.UUID(user_id)
+
+            async for db in get_db():
+                events = []
+                if scenario == "leading_gap":
+                    events.append(
+                        PumpEvent(
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=start + timedelta(minutes=10),
+                            units=1.0,
+                            received_at=start + timedelta(minutes=10),
+                            source="test",
+                        )
+                    )
+                elif scenario == "seed":
+                    events.append(
+                        PumpEvent(
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=start - timedelta(minutes=10),
+                            units=1.0,
+                            received_at=start - timedelta(minutes=10),
+                            source="test",
+                        )
+                    )
+
+                db.add_all(
+                    [
+                        GlucoseReading(
+                            user_id=uid,
+                            value=120,
+                            reading_timestamp=start + timedelta(minutes=1),
+                            trend=TrendDirection.FLAT,
+                            trend_rate=0.0,
+                            received_at=start + timedelta(minutes=1),
+                            source="test",
+                        ),
+                        *events,
+                    ]
+                )
+                await db.commit()
+                brief = await calculate_metrics(uid, db, start, end)
+                break
+
+            response = await client.get(
+                "/api/integrations/insulin/summary",
+                params={"start": start.isoformat(), "end": end.isoformat()},
+                cookies={settings.jwt_cookie_name: cookie},
+            )
+
+        assert response.status_code == 200, response.text
+        summary = response.json()
+        assert brief.insulin_breakdown is not None
+        assert brief.insulin_breakdown.basal_units == pytest.approx(
+            expected_brief_units
+        )
+        assert summary["basal_units"] == pytest.approx(expected_summary_units)
+        assert brief.insulin_breakdown.basal_estimate_complete is expected_complete
+        assert summary["basal_estimate_complete"] is expected_complete
+        assert brief.insulin_breakdown._basal_estimate_evaluated is expected_evaluated
 
     @pytest.mark.parametrize(
         ("source_duration_seconds", "expected_daily_basal", "expected_complete"),

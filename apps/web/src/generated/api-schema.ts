@@ -6853,7 +6853,7 @@ export interface components {
         InsulinSummaryResponse: {
             /**
              * Basal Estimate Complete
-             * @description False when an explicit temp-basal gap could not be filled because the scheduled profile rate was unavailable
+             * @description False when basal delivery includes an unknown rate, a percent temp, an unbounded suspend, or a gap with no known scheduled profile rate
              * @default true
              */
             basal_estimate_complete: boolean;

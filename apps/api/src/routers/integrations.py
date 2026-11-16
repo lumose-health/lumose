@@ -4295,7 +4295,7 @@ async def get_insulin_summary(
     # which integration wrote it. See issue #574 / source-agnostic-
     # widgets discussion.
     ns_dedupe_sql = await nightscout_duplicate_exclusion_sql(db, current_user.id)
-    _table = PumpEvent.__tablename__
+    _bolus_table = PumpEvent.__tablename__
     _bolus_val = PumpEventType.BOLUS.value
     _correction_val = PumpEventType.CORRECTION.value
     bolus_query = text(  # nosemgrep: avoid-sqlalchemy-text
@@ -4303,7 +4303,7 @@ async def get_insulin_summary(
         WITH deliveries AS (
             SELECT event_timestamp, units,
                    bool_or(event_type = :correction_type) AS is_correction
-            FROM {_table}
+            FROM {_bolus_table}
             WHERE user_id = :user_id
               AND {ns_dedupe_sql}
               AND event_timestamp >= :cutoff AND event_timestamp <= :now
@@ -4338,20 +4338,24 @@ async def get_insulin_summary(
     _basal_val = PumpEventType.BASAL.value
     _suspend_val = PumpEventType.SUSPEND.value
     _resume_val = PumpEventType.RESUME.value
+    _table = PumpEvent.__tablename__
     basal_ctes = f"""
         WITH prior AS (
             SELECT id, event_timestamp, event_type, units, duration_minutes
             FROM {_table}
             WHERE user_id = :user_id
               AND event_type IN (:basal_type, :suspend_type, :resume_type)
-              AND (
-                    event_type != :basal_type
-                    OR units IS NULL
-                    OR units BETWEEN 0 AND :max_rate
-              )
               AND {ns_dedupe_sql}
               AND event_timestamp < :cutoff
             ORDER BY event_timestamp DESC,
+                     CASE
+                         WHEN event_type = :suspend_type THEN 2
+                         WHEN event_type = :basal_type
+                              AND (units IS DISTINCT FROM 0
+                                   OR duration_minutes IS DISTINCT FROM 0)
+                             THEN 1
+                         ELSE 0
+                     END DESC,
                      duration_minutes ASC NULLS LAST,
                      id DESC
             LIMIT 1
@@ -4361,11 +4365,6 @@ async def get_insulin_summary(
             FROM {_table}
             WHERE user_id = :user_id
               AND event_type IN (:basal_type, :suspend_type, :resume_type)
-              AND (
-                    event_type != :basal_type
-                    OR units IS NULL
-                    OR units BETWEEN 0 AND :max_rate
-              )
               AND {ns_dedupe_sql}
               AND event_timestamp >= :cutoff
               AND event_timestamp <= :now
@@ -4384,7 +4383,17 @@ async def get_insulin_summary(
                 duration_minutes,
                 ROW_NUMBER() OVER (
                     PARTITION BY event_timestamp
-                    ORDER BY duration_minutes ASC NULLS LAST, id DESC
+                    ORDER BY
+                        CASE
+                            WHEN event_type = :suspend_type THEN 2
+                            WHEN event_type = :basal_type
+                                 AND (units IS DISTINCT FROM 0
+                                      OR duration_minutes IS DISTINCT FROM 0)
+                                THEN 1
+                            ELSE 0
+                        END DESC,
+                        duration_minutes ASC NULLS LAST,
+                        id DESC
                 ) AS row_rank
             FROM basal_rows
         ),
@@ -4415,17 +4424,23 @@ async def get_insulin_summary(
         + """
         , basal_aggregate AS (
             SELECT COALESCE(SUM(
-                units * LEAST(
-                    EXTRACT(EPOCH FROM (
+                units * CASE
+                    WHEN duration_minutes IS NULL THEN LEAST(
+                        EXTRACT(EPOCH FROM (
+                            LEAST(COALESCE(next_ts, :now), :now)
+                            - GREATEST(event_timestamp, :cutoff)
+                        )) / 3600.0,
+                        :max_gap
+                    )
+                    ELSE EXTRACT(EPOCH FROM (
                         LEAST(COALESCE(next_ts, :now), :now)
                         - GREATEST(event_timestamp, :cutoff)
-                    )) / 3600.0,
-                    :max_gap
-                )
+                    )) / 3600.0
+                END
             ), 0) AS total_basal
             FROM basal_ordered
             WHERE event_type = :basal_type
-              AND units IS NOT NULL
+              AND units BETWEEN 0 AND :max_rate
               AND LEAST(COALESCE(next_ts, :now), :now)
                 > GREATEST(event_timestamp, :cutoff)
         ),
@@ -4437,6 +4452,11 @@ async def get_insulin_summary(
               AND (
                     event_type = :resume_type
                     OR units IS NULL
+                    OR (
+                        event_type = :basal_type
+                        AND units IS NOT NULL
+                        AND units NOT BETWEEN 0 AND :max_rate
+                    )
                     OR (
                         event_type = :suspend_type
                         AND (
@@ -4503,7 +4523,7 @@ async def get_insulin_summary(
                 )
         elif row.event_type == _resume_val:
             kind = BasalEventKind.RESUME
-        elif row.units is None:
+        elif row.units is None or not 0 <= row.units <= MAX_BASAL_RATE:
             kind = BasalEventKind.UNKNOWN_RATE
         elif row.units == 0 and duration == 0:
             kind = BasalEventKind.CANCEL
@@ -4516,11 +4536,18 @@ async def get_insulin_summary(
                 interval_end=interval_end,
             )
         )
-        if row.event_type == _basal_val and row.units is not None:
+        if (
+            row.event_type == _basal_val
+            and row.units is not None
+            and 0 <= row.units <= MAX_BASAL_RATE
+        ):
             legacy_events.append(
                 BasalEvent(
                     timestamp=row.event_timestamp,
                     rate=row.units,
+                    duration_minutes=math.ceil(
+                        (interval_end - row.event_timestamp).total_seconds() / 60
+                    ),
                     interval_end=interval_end,
                 )
             )
@@ -4539,6 +4566,8 @@ async def get_insulin_summary(
             legacy_events,
             cutoff,
             now,
+            # Legacy events span their full SQL aggregate interval explicitly,
+            # so the durationless cap does not apply to this subtraction.
             legacy_max_gap_hours=_BASAL_MAX_GAP_HOURS,
         )
         basal_units += corrected.units - legacy.units
@@ -4561,7 +4590,7 @@ async def get_insulin_summary(
         f"""
         WITH injections AS (
             SELECT event_timestamp, units
-            FROM {_table}
+            FROM {_bolus_table}
             WHERE user_id = :user_id
               AND {ns_dedupe_sql}
               AND event_timestamp >= :cutoff AND event_timestamp <= :now

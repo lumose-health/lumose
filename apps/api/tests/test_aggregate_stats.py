@@ -15,6 +15,7 @@ from src.models.glucose import GlucoseReading, TrendDirection
 from src.models.pump_data import PumpEvent, PumpEventType
 from src.models.pump_profile import PumpProfile
 from src.models.user import User
+from src.services.daily_brief import calculate_metrics
 
 
 def unique_email(prefix: str = "stats") -> str:
@@ -538,15 +539,6 @@ class TestInsulinSummary:
                         PumpEvent(
                             user_id=uid,
                             event_type=PumpEventType.BASAL,
-                            event_timestamp=temp_start + timedelta(minutes=10),
-                            units=1000.0,
-                            is_automated=True,
-                            received_at=temp_start + timedelta(minutes=10),
-                            source="corrupt",
-                        ),
-                        PumpEvent(
-                            user_id=uid,
-                            event_type=PumpEventType.BASAL,
                             event_timestamp=end,
                             units=1.0,
                             is_automated=True,
@@ -747,6 +739,194 @@ class TestInsulinSummary:
         assert response.status_code == 200, response.text
         assert response.json()["basal_units"] == pytest.approx(expected_basal)
         assert response.json()["basal_estimate_complete"] is expected_complete
+
+    @pytest.mark.parametrize("suspend_has_higher_id", [False, True])
+    async def test_same_timestamp_suspend_wins_over_basal_in_both_id_orders(
+        self, suspend_has_higher_id
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            cookie, user_id = await register_and_login(client)
+            start = datetime.now(UTC) - timedelta(hours=2)
+            end = start + timedelta(hours=1)
+            uid = uuid.UUID(user_id)
+            id_base = uuid.uuid4().int & ~0b11
+            low_id = uuid.UUID(int=id_base)
+            high_id = uuid.UUID(int=id_base + 1)
+
+            async for db in get_db():
+                db.add_all(
+                    [
+                        PumpEvent(
+                            id=high_id if suspend_has_higher_id else low_id,
+                            user_id=uid,
+                            event_type=PumpEventType.SUSPEND,
+                            event_timestamp=start,
+                            units=None,
+                            received_at=start,
+                            source="test",
+                        ),
+                        PumpEvent(
+                            id=low_id if suspend_has_higher_id else high_id,
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=start,
+                            units=1.5,
+                            received_at=start,
+                            source="test",
+                        ),
+                        PumpEvent(
+                            id=uuid.UUID(int=id_base + 2),
+                            user_id=uid,
+                            event_type=PumpEventType.RESUME,
+                            event_timestamp=end,
+                            units=None,
+                            received_at=end,
+                            source="test",
+                        ),
+                    ]
+                )
+                await db.commit()
+                break
+
+            response = await client.get(
+                "/api/integrations/insulin/summary",
+                params={"start": start.isoformat(), "end": end.isoformat()},
+                cookies={settings.jwt_cookie_name: cookie},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["basal_units"] == 0
+        assert response.json()["basal_estimate_complete"] is True
+
+    async def test_out_of_range_basal_stops_prior_rate_in_brief_and_summary(self):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            cookie, user_id = await register_and_login(client)
+            start = datetime.now(UTC) - timedelta(days=2)
+            end = start + timedelta(days=1)
+            uid = uuid.UUID(user_id)
+
+            async for db in get_db():
+                db.add_all(
+                    [
+                        GlucoseReading(
+                            user_id=uid,
+                            value=120,
+                            reading_timestamp=start + timedelta(minutes=1),
+                            trend=TrendDirection.FLAT,
+                            trend_rate=0.0,
+                            received_at=start + timedelta(minutes=1),
+                            source="test",
+                        ),
+                        PumpEvent(
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=start,
+                            units=1.0,
+                            received_at=start,
+                            source="test",
+                        ),
+                        PumpEvent(
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=start + timedelta(minutes=10),
+                            units=1000.0,
+                            received_at=start + timedelta(minutes=10),
+                            source="corrupt",
+                        ),
+                    ]
+                )
+                await db.commit()
+                brief = await calculate_metrics(uid, db, start, end)
+                break
+
+            response = await client.get(
+                "/api/integrations/insulin/summary",
+                params={"start": start.isoformat(), "end": end.isoformat()},
+                cookies={settings.jwt_cookie_name: cookie},
+            )
+
+        assert response.status_code == 200, response.text
+        summary = response.json()
+        assert brief.insulin_breakdown is not None
+        assert brief.insulin_breakdown.basal_units == pytest.approx(0.2)
+        assert summary["basal_units"] == pytest.approx(
+            brief.insulin_breakdown.basal_units
+        )
+        assert brief.insulin_breakdown.basal_estimate_complete is False
+        assert summary["basal_estimate_complete"] is False
+
+    @pytest.mark.parametrize(
+        ("source_duration_seconds", "expected_daily_basal", "expected_complete"),
+        [(21599, 19.1, False), (21600, 19.2, True), (21601, 19.2, True)],
+    )
+    async def test_duration_boundary_agrees_between_brief_and_summary(
+        self,
+        source_duration_seconds,
+        expected_daily_basal,
+        expected_complete,
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            cookie, user_id = await register_and_login(client)
+            start = datetime.now(UTC) - timedelta(days=2)
+            end = start + timedelta(hours=6)
+            uid = uuid.UUID(user_id)
+
+            async for db in get_db():
+                db.add_all(
+                    [
+                        GlucoseReading(
+                            user_id=uid,
+                            value=120,
+                            reading_timestamp=start + timedelta(minutes=1),
+                            trend=TrendDirection.FLAT,
+                            trend_rate=0.0,
+                            received_at=start + timedelta(minutes=1),
+                            source="test",
+                        ),
+                        PumpEvent(
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=start,
+                            units=0.8,
+                            duration_minutes=source_duration_seconds // 60,
+                            received_at=start,
+                            source="glooko",
+                        ),
+                        PumpEvent(
+                            user_id=uid,
+                            event_type=PumpEventType.BASAL,
+                            event_timestamp=end,
+                            units=0.8,
+                            received_at=end,
+                            source="glooko",
+                        ),
+                    ]
+                )
+                await db.commit()
+                brief = await calculate_metrics(uid, db, start, end)
+                break
+
+            response = await client.get(
+                "/api/integrations/insulin/summary",
+                params={"start": start.isoformat(), "end": end.isoformat()},
+                cookies={settings.jwt_cookie_name: cookie},
+            )
+
+        assert response.status_code == 200, response.text
+        summary = response.json()
+        assert brief.insulin_breakdown is not None
+        assert summary["basal_units"] == pytest.approx(expected_daily_basal)
+        assert summary["basal_units"] * 0.25 == pytest.approx(
+            brief.insulin_breakdown.basal_units, abs=0.05
+        )
+        assert brief.insulin_breakdown.basal_estimate_complete is expected_complete
+        assert summary["basal_estimate_complete"] is expected_complete
 
     async def test_rapid_basal_rows_stay_in_sql_aggregate(self):
         """Five-minute rows whose durations meet the next event need no correction."""

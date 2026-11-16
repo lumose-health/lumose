@@ -5083,7 +5083,7 @@
         "properties": {
           "basal_estimate_complete": {
             "default": true,
-            "description": "False when an explicit temp-basal gap could not be filled because the scheduled profile rate was unavailable",
+            "description": "False when basal delivery includes an unknown rate, a percent temp, an unbounded suspend, or a gap with no known scheduled profile rate",
             "title": "Basal Estimate Complete",
             "type": "boolean"
           },

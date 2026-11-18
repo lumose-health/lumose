@@ -644,6 +644,12 @@ async def generate_daily_brief(
         readings_count=metrics.readings_count,
         correction_count=metrics.correction_count,
         total_insulin=metrics.total_insulin,
+        basal_estimate_complete=(
+            metrics.insulin_breakdown.basal_estimate_complete
+            if metrics.insulin_breakdown is not None
+            and metrics.insulin_breakdown._basal_estimate_evaluated
+            else None
+        ),
         ai_summary=safety_result.sanitized_text,
         ai_model=ai_response.model,
         ai_provider=ai_response.provider.value,

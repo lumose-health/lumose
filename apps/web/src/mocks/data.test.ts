@@ -6,6 +6,7 @@ import {
   buildGlucoseHistoryResponse,
   buildGlucoseStats,
   buildInsulinSummary,
+  buildMockDailyBrief,
   buildMockInsightDetail,
   buildMockInsights,
   buildMockKnowledgeDocuments,
@@ -808,4 +809,24 @@ describe("mock data generator", () => {
       1,
     );
   });
+
+  it.each([false, null])(
+    "can mock basal estimate completeness as %s",
+    (basalEstimateComplete) => {
+      const snapshot = buildMockDataSnapshot(
+        baseState,
+        new Date("2026-07-06T12:00:00.000Z"),
+      );
+
+      const brief = buildMockDailyBrief(
+        baseState,
+        snapshot,
+        24,
+        "00000000-0000-4000-8000-000000000002",
+        basalEstimateComplete,
+      );
+
+      expect(brief.basal_estimate_complete).toBe(basalEstimateComplete);
+    },
+  );
 });

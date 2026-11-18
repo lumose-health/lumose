@@ -1338,6 +1338,7 @@ export function buildMockDailyBrief(
   snapshot: MockDataSnapshot,
   hours = 24,
   id = createMockId(),
+  basalEstimateComplete: boolean | null = true,
 ): MockDailyBriefResponse {
   const safeHours = Math.max(1, Math.min(72, Math.round(hours)));
   const readings = getBriefReadings(snapshot, safeHours);
@@ -1392,6 +1393,7 @@ export function buildMockDailyBrief(
       primaryPumpSource(state) === "none"
         ? null
         : round(basalUnits + basalInjectionUnits + bolusUnits, 1),
+    basal_estimate_complete: basalEstimateComplete,
     ai_model: "mock-daily-brief-v1",
     ai_provider: "msw",
     input_tokens: Math.max(900, readings.length * 8),
